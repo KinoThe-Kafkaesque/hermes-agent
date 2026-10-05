@@ -150,6 +150,35 @@ def _assert_not_delegated_child_mutation(path: "str | Path | None" = None) -> No
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
+_KANBAN_OBSERVERS_READY = False
+
+
+def _ensure_kanban_observers() -> None:
+    """Wire config-declared observers once per process before the first fire.
+
+    Kanban events are emitted from many short-lived processes (CLI ``kanban`` verbs,
+    the Desktop app, a worker, the gateway dispatcher). Shell hooks are otherwise
+    only registered on agent-command startup paths, so a ``hermes kanban comment``
+    from the CLI fired into a process with nothing subscribed and the event was
+    silently dropped. Registering here makes delivery independent of which process
+    produced the event. Cheap no-op after the first call.
+    """
+    global _KANBAN_OBSERVERS_READY
+    if _KANBAN_OBSERVERS_READY:
+        return
+    _KANBAN_OBSERVERS_READY = True
+    try:
+        from hermes_cli.config import load_config
+        from agent.shell_hooks import register_from_config as _register_shell
+        from agent.outbound_webhooks import register_from_config as _register_outbound
+
+        cfg = load_config()
+        _register_shell(cfg)
+        _register_outbound(cfg)
+    except Exception:  # pragma: no cover - defensive
+        _log.debug("kanban observer registration failed", exc_info=True)
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -157,6 +186,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
     try:
         from hermes_cli.lifecycle import invoke_hook
 
+        _ensure_kanban_observers()
         invoke_hook(event, task_id=task_id, profile_name=_hook_profile_name(), **fields)
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
@@ -167,6 +197,24 @@ def _fire_task_hook(event: str, task: Optional["Task"], task_id: str, run_id: Op
     _fire_kanban_lifecycle_hook(
         event, task_id, board=get_current_board(),
         assignee=task.assignee if task else None, run_id=run_id, **fields,
+    )
+
+
+def _fire_task_hook_by_id(conn: sqlite3.Connection, event: str, task_id: str, **fields: Any) -> None:
+    """``_fire_task_hook`` for callers that hold only an id (e.g. comments).
+
+    Reads ``assignee`` through the caller's connection so observers see the same
+    field the transition hooks carry, then fires the hook directly — building a
+    partial ``Task`` for ``_fire_task_hook`` would need every required dataclass
+    field. ``fields`` must NOT contain ``assignee``/``board``/``run_id`` (supplied here).
+    """
+    try:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    except Exception:  # pragma: no cover - defensive
+        row = None
+    _fire_kanban_lifecycle_hook(
+        event, task_id, board=get_current_board(),
+        assignee=row[0] if row else None, run_id=None, **fields,
     )
 
 
@@ -1853,7 +1901,16 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+    # Lifecycle hook AFTER the txn commits, so observers never see partial state.
+    # Human input on a card is the one signal with no other delivery path: without
+    # this, a reply to a blocked question (kanban_block kind=needs_input) sits
+    # unread until some agent happens to re-read the card.
+    _fire_task_hook_by_id(
+        conn, "kanban_task_commented", task_id,
+        author=author.strip(), body=body.strip(), comment_id=comment_id,
+    )
+    return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:

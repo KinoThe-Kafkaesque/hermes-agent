@@ -160,6 +160,11 @@ VALID_HOOKS: Set[str] = {
     # spawn; completed/blocked fire in the WORKER (or whichever process drove it). Kwargs: task_id,
     # board, assignee, run_id, profile_name; completed adds summary, blocked adds reason.
     "kanban_task_claimed", "kanban_task_completed", "kanban_task_blocked",
+    # Comment observer: fires in WHICHEVER process wrote the comment (CLI, dashboard,
+    # worker, gateway reflex) AFTER the DB commit. Kwargs: task_id, board, run_id=None,
+    # profile_name, assignee=None, author, body, comment_id. The only delivery path for
+    # human input on a card — a reply to a needs_input block has no other signal.
+    "kanban_task_commented",
     # Kanban worker/mutation/tick observers; returns ignored; fire sites short-circuit on
     # has_hook(). Kwargs: task_id, profile_name, board, assignee, run_id plus, per hook:
     # worker_spawned (DISPATCHER, after PID persisted, inside the dispatch lock — stay fast):
