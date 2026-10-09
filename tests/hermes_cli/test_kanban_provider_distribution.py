@@ -10,6 +10,10 @@ arithmetic — fails here.
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -27,7 +31,9 @@ SECONDARY = ("nous", "stepfun/step-5-preview:free")
 
 @pytest.fixture(autouse=True)
 def _clean_demotion_state():
-    """The tally is process-local; every test starts from a healthy fleet."""
+    """The in-process tally starts empty; the SHARED tally lives in each test's
+    own temp board, so a fresh board is a healthy fleet without clearing state
+    that belongs to a live dispatcher process."""
     kpd.reset_demotion_state()
     yield
     kpd.reset_demotion_state()
@@ -413,3 +419,277 @@ def test_default_spawn_fails_open_when_route_resolution_breaks(kanban_home, monk
     # Still spawned; the worker falls back to the profile's own model.
     assert captured["cmd"]
     assert _flag_value(captured["cmd"], "-m") is None
+
+
+# --- Shared (cross-process) tally --------------------------------------------
+# The tally used to be process-local: a wall observed by one dispatcher did not
+# demote for another until each re-observed its own wall. The durable record of a
+# wall is the ``rate_limited`` run row the reclaim transaction writes, attributed
+# to the provider/model that served the run, so every dispatcher reads ONE tally
+# from the board DB. These tests drive that path end to end.
+
+
+def _persisted_wall(conn, tid: str, pid: int, provider: str, model: str,
+                    *, ended_at: float | None = None, outcome: str = "rate_limited",
+                    pid_in_metadata: bool = True) -> None:
+    """Write the run row a wall leaves behind — the SHARED tally's only input.
+
+    Shaped exactly like the reclaim transaction's: ``outcome=rate_limited``, the
+    worker PID on the run row (``_set_worker_pid``) and in the exit payload, and
+    the observed route in the metadata (``t_6ed58421``'s attribution).
+    ``pid_in_metadata=False`` covers a run whose metadata lost the pid, which
+    must still deduplicate through the run row's own column.
+    """
+    kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w{pid}")
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+    run_id = kb.get_task(conn, tid).current_run_id
+    conn.execute("UPDATE task_runs SET worker_pid=? WHERE id=?", (pid, run_id))
+    meta = {"provider": provider, "model": model}
+    if pid_in_metadata:
+        meta["pid"] = pid
+    conn.execute(
+        "UPDATE task_runs SET outcome=?, status=?, ended_at=?, metadata=? WHERE id=?",
+        (outcome, outcome, ended_at if ended_at is not None else int(time.time()),
+         kb._json_or_null(meta), run_id),
+    )
+    conn.commit()
+
+
+def test_a_persisted_wall_demotes_for_a_process_that_never_saw_it(kanban_home):
+    """A wall another dispatcher recorded demotes HERE, with no local observation.
+
+    This is the coverage gap the card closes: process B never reaps the worker,
+    so it has no in-process stamp — it must still see the wall.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        _persisted_wall(conn, tid, 70001, *PRIMARY)
+        task = kb.get_task(conn, kb.create_task(conn, title="t2", assignee="scrapingcow"))
+
+        # No in-process stamp at all: the shared tally alone must carry it.
+        assert kpd.walled_routes() == set()
+        _persisted_wall(conn, kb.create_task(conn, title="t3", assignee="a"),
+                        70002, *PRIMARY)
+        assert kpd.walled_routes() == {PRIMARY}
+
+        # …and the spawn path acts on it.
+        _argv, model = _argv_route(task)
+        assert model == SECONDARY[1]
+
+
+def test_a_wall_this_process_observed_is_not_counted_twice(kanban_home):
+    """The stamp and the run row for the SAME wall are one wall, not two.
+
+    Without the event-key dedupe the recording process's own wall would arrive
+    from both sources, halving the effective threshold. The key comes from the
+    pid in the run metadata (the reclaim payload).
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        _persisted_wall(conn, tid, 70003, *PRIMARY)
+
+        count = kpd.record_rate_limit(*PRIMARY, task_id=tid, pid=70003)
+        assert count == 1, "the same wall was counted twice"
+        assert kpd.walled_routes() == set()  # threshold 2; one wall is not enough
+
+        # A genuinely DIFFERENT wall on the same route is a second one.
+        count = kpd.record_rate_limit(*PRIMARY, task_id="t_other", pid=70004)
+        assert count == 2
+        assert kpd.walled_routes() == {PRIMARY}
+
+
+def test_dedupe_also_works_without_a_pid_in_the_run_metadata(kanban_home):
+    """A run whose metadata lost the pid still dedupes, via ``task_runs.worker_pid``.
+
+    Both key sources must agree, or a wall recorded by this process would be
+    counted twice and the threshold would halve.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        _persisted_wall(conn, tid, 70006, *PRIMARY, pid_in_metadata=False)
+
+        count = kpd.record_rate_limit(*PRIMARY, task_id=tid, pid=70006)
+        assert count == 1, "the same wall was counted twice (run-row pid fallback)"
+        assert kpd.walled_routes() == set()
+
+
+def test_persisted_wall_outside_the_window_does_not_demote(kanban_home):
+    """The window still expires: a wall older than 900 s is not a demotion."""
+    with kbc.connect() as conn:
+        for n, pid in enumerate((70010, 70011)):
+            _persisted_wall(
+                conn, kb.create_task(conn, title=f"old{n}", assignee="a"), pid, *PRIMARY,
+                ended_at=int(time.time()) - (kpd.demotion_window_seconds() + 60),
+            )
+        assert kpd.walled_routes() == set()
+        # A wall INSIDE the window is the control: the same read path demotes.
+        _persisted_wall(conn, kb.create_task(conn, title="fresh", assignee="a"),
+                        70012, *PRIMARY)
+        _persisted_wall(conn, kb.create_task(conn, title="fresh2", assignee="a"),
+                        70013, *PRIMARY)
+        assert kpd.walled_routes() == {PRIMARY}
+
+
+def test_unnamed_persisted_wall_demotes_nothing(kanban_home):
+    """A legacy row with no attributed route is not charged to any provider."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w70020")
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=?, metadata=? WHERE id=?",
+            (int(time.time()), kb._json_or_null({"exit_code": 75}), run_id),
+        )
+        conn.commit()
+        assert kpd.walled_routes() == set()
+
+
+def test_shared_tally_read_failure_is_fail_open(kanban_home, monkeypatch):
+    """Mutation: point the tally read at a table that does not exist.
+
+    The card must STILL spawn on the primary. A broken tally is a demotion
+    signal lost, never a spawn blocked.
+    """
+    captured = _capture_spawn(monkeypatch)
+    monkeypatch.setattr(
+        kpd, "_WALL_QUERY",
+        "SELECT task_id, ended_at, worker_pid, metadata FROM no_such_table_here",
+    )
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, kb.create_task(conn, title="t", assignee="scrapingcow"))
+        kb.claim_task(conn, task.id)
+        assert kpd.walled_routes() == set()
+        assert kpd.shared_wall_read_error(), "the failure must be recorded, not swallowed"
+        _spawn(task, captured)
+    assert captured["cmd"], "the card must still spawn"
+    assert _flag_value(captured["cmd"], "-m") == PRIMARY[1]
+    # And a genuinely walled route is not rescued by the broken read either:
+    # the in-process tally still demotes.
+    for _ in range(kpd.demotion_threshold()):
+        kpd.record_rate_limit(*PRIMARY, task_id="t_local", pid=1)
+    assert kpd.walled_routes() == {PRIMARY}
+
+
+def test_explicit_pin_is_never_demoted_by_a_persisted_wall(kanban_home):
+    """The shared tally must not reach a pinned card either."""
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, kb.create_task(
+            conn, title="pinned", assignee="scrapingcow",
+            model_override="some-model", provider_override="some-provider"))
+        for pid in (70030, 70031, 70032):
+            _persisted_wall(conn, kb.create_task(conn, title=f"w{pid}", assignee="a"),
+                            pid, "some-provider", "some-model")
+        route, reasons = kbd.resolve_task_route(task)
+        assert (route.provider, route.model) == ("some-provider", "some-model")
+        assert any("pinned by card" in r for r in reasons)
+
+
+# --- The real two-process probe ---------------------------------------------
+# Everything above is single-process. The card's acceptance is a REAL two-process
+# proof: a wall recorded in process A is observed by process B inside the window.
+
+_TWO_PROCESS_SCRIPT = r'''
+import json, os, sys, time
+sys.path.insert(0, sys.argv[1])
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_provider_distribution as kpd
+
+role = sys.argv[2]
+tid = sys.argv[3]
+pid = int(sys.argv[4])
+provider, model = sys.argv[5], sys.argv[6]
+
+out = {"role": role, "pid": os.getpid()}
+if role == "wall":
+    # Record the wall exactly as the reclaim path does: stamp the in-process
+    # tally AND close the run row (the shared record).
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        count = kpd.record_rate_limit(provider, model, task_id=tid, pid=pid)
+        out["stamp_count"] = count
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=?, metadata=? WHERE id=?",
+            (int(time.time()),
+             kb._json_or_null({"provider": provider, "model": model, "pid": pid}),
+             task.current_run_id),
+        )
+        conn.execute("UPDATE task_runs SET worker_pid=? WHERE id=?",
+                     (pid, task.current_run_id))
+        conn.commit()
+else:
+    # A DIFFERENT process: fresh interpreter, empty in-process tally.
+    out["walled_routes"] = sorted("{}|{}".format(p, m) for p, m in kpd.walled_routes())
+    out["local_tally_size"] = len(kpd._wall_events)
+    out["shared_read_error"] = kpd.shared_wall_read_error()
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, tid)
+        route, reasons = kbd.resolve_task_route(task)
+    out["chosen"] = "{}/{}".format(route.provider, route.model) if route else None
+    out["reasons"] = reasons
+
+print("PROBE=" + json.dumps(out))
+'''
+
+
+def test_two_processes_share_one_tally(kanban_home, tmp_path):
+    """A wall recorded in process A is observed by process B inside the window.
+
+    A real subprocess probe, not a single-process simulation: process B is a
+    fresh interpreter with an empty in-process tally, so the only way it can see
+    the wall is the shared (persisted) record.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    script = tmp_path / "two_process_wall_probe.py"
+    script.write_text(_TWO_PROCESS_SCRIPT, encoding="utf-8")
+
+    home = tmp_path / ".hermes"
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_KANBAN_HOME"] = str(home)
+    for pin in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_ATTACHMENTS_ROOT",
+                "HERMES_KANBAN_TASK", "HERMES_DELEGATED_CHILD_CONTEXT"):
+        env.pop(pin, None)
+
+    with kbc.connect() as conn:
+        wall_task = kb.create_task(conn, title="wall", assignee="scrapingcow")
+        kb.claim_task(conn, wall_task, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w71001")
+        # The threshold is 2, so ONE persisted wall must not be enough…
+        reader_task = kb.create_task(conn, title="reader", assignee="scrapingcow")
+
+    def _run(role: str, tid: str, pid: int) -> dict:
+        proc = subprocess.run(
+            [sys.executable, str(script), str(repo_root), role, tid, str(pid), *PRIMARY],
+            env=env, capture_output=True, text=True, timeout=120,
+        )
+        assert proc.returncode == 0, proc.stderr
+        line = [ln for ln in proc.stdout.splitlines() if ln.startswith("PROBE=")][-1]
+        return json.loads(line.split("=", 1)[1])
+
+    first = _run("wall", wall_task, 71001)
+    assert first["stamp_count"] == 1
+
+    reader = _run("read", reader_task, 71001)
+    assert reader["local_tally_size"] == 0, "the reader must have NO in-process tally"
+    assert reader["pid"] != first["pid"], "the probe must be two processes"
+    assert reader["shared_read_error"] is None
+    assert reader["walled_routes"] == []          # one wall < threshold 2
+    assert reader["chosen"] == f"{PRIMARY[0]}/{PRIMARY[1]}"
+
+    # Process A records a SECOND wall; process B now demotes on the shared tally.
+    with kbc.connect() as conn:
+        second = kb.create_task(conn, title="wall2", assignee="scrapingcow")
+        kb.claim_task(conn, second, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w71002")
+    _run("wall", second, 71002)
+
+    reader2 = _run("read", reader_task, 71002)
+    assert reader2["local_tally_size"] == 0
+    assert reader2["walled_routes"] == [f"{PRIMARY[0]}|{PRIMARY[1]}"]
+    assert reader2["chosen"] == f"{SECONDARY[0]}/{SECONDARY[1]}", (
+        "process B did not demote on a wall it never observed"
+    )
+

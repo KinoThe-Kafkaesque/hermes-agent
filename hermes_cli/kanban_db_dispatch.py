@@ -31,7 +31,9 @@ from hermes_cli.kanban_provider_distribution import (  # noqa: F401 — re-expor
     normalize_route,
     parse_exit_trailer,
     record_rate_limit,
+    requeue_failover_skip,
     select_route,
+    shared_wall_read_error,
     strip_exit_trailer,
     walled_route_details,
     walled_routes,
@@ -1155,10 +1157,13 @@ def _classify_dead_worker_exit(
         # Feed the demotion tally: the next spawn of this card (and of any other
         # card on the same route) prefers the next healthy provider instead of
         # re-hitting the wall. Only when the trailer NAMED the route — an
-        # unnamed wall cannot be attributed and must not demote anything.
+        # unnamed wall cannot be attributed and must not demote anything. The
+        # tally is SHARED: this stamp and the run row the reclaim txn is writing
+        # carry the same event key, so the wall counts once fleet-wide.
         route = dead.route
         if route is not None:
-            dead.event_payload["wall_count"] = record_rate_limit(route.provider, route.model)
+            dead.event_payload["wall_count"] = record_rate_limit(
+                route.provider, route.model, task_id=task_id, pid=pid)
         return dead
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
@@ -2802,7 +2807,8 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def resolve_task_route(task: Task, *, skip: Optional[set] = None) -> "tuple[Optional[ProviderRoute], list[str]]":
+def resolve_task_route(task: Task, *, skip: Optional[set] = None,
+                       board: Optional[str] = None) -> "tuple[Optional[ProviderRoute], list[str]]":
     """``(route, reasons)`` a card should START on, with distribution applied.
 
     An explicit per-card pin (``model_override``/``provider_override``) always
@@ -2812,6 +2818,10 @@ def resolve_task_route(task: Task, *, skip: Optional[set] = None) -> "tuple[Opti
     its rate-limit threshold (demotion) and any route this card already failed
     over away from (sticky advance on requeue). ``reasons`` explains the choice
     for the run metadata and the log.
+
+    ``board`` is the board being dispatched: the tally is SHARED across
+    dispatcher processes and read from that board's DB, so the wrong board
+    would demote on another fleet's walls.
     """
     pinned = normalize_route(task.provider_override, task.model_override)
     if pinned is not None:
@@ -2819,7 +2829,7 @@ def resolve_task_route(task: Task, *, skip: Optional[set] = None) -> "tuple[Opti
     chain = build_chain(task.assignee, None)
     if not chain:
         return None, ["no provider route resolved; worker uses the profile config"]
-    return select_route(chain, skip=skip)
+    return select_route(chain, skip=skip, board=board)
 
 
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str],
@@ -2925,48 +2935,14 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _requeue_failover_skip(task: Task) -> set:
-    """Routes this card should NOT restart on after a ``rate_limited`` requeue.
+def _requeue_failover_skip(task: Task, *, board: Optional[str] = None) -> set:
+    """Dispatcher-internal name for the shared failover skip set.
 
-    Reads the latest closed run's recorded provider/model. Sticky-advance, not
-    random: a genuinely-walled provider is skipped rather than retried into the
-    same wall, and the advance is bounded (one route) so a card that keeps
-    walling walks its chain forward rather than thrashing.
+    ``kanban_provider_distribution.requeue_failover_skip`` owns the rule (that
+    module reads a run's recorded route); this alias keeps the dispatcher-local
+    name its callers and tests already use.
     """
-    if task.current_run_id is None:
-        return set()
-    meta = _latest_run_metadata(task.id)
-    if meta.get("outcome") != "rate_limited":
-        return set()
-    route = normalize_route(meta.get("provider"), meta.get("model"))
-    return {route.identity} if route is not None else set()
-
-
-def _latest_run_metadata(task_id: str) -> dict:
-    """``{outcome, provider, model, ...}`` of the latest CLOSED run; {} when none.
-
-    ``provider``/``model`` fall back through both writers: the observed route the
-    worker reported at exit, then the route the spawn requested.
-    """
-    try:
-        from hermes_cli import kanban_db_connect as _kbc
-
-        with _kbc.connect() as conn:
-            row = conn.execute(
-                "SELECT outcome, metadata FROM task_runs WHERE task_id = ? "
-                "AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-    except Exception:
-        return {}
-    if row is None:
-        return {}
-    meta = dict(_json_dict(row["metadata"]) or {})
-    meta["outcome"] = row["outcome"]
-    if not meta.get("provider") and meta.get("requested_provider"):
-        meta["provider"] = meta["requested_provider"]
-        meta["model"] = meta.get("requested_model") or meta.get("model")
-    return meta
+    return requeue_failover_skip(task, board=board)
 
 
 def _merge_run_metadata(conn: sqlite3.Connection, task_id: str, exit_payload: dict) -> dict:
@@ -2984,7 +2960,7 @@ def _merge_run_metadata(conn: sqlite3.Connection, task_id: str, exit_payload: di
         ).fetchone()
     except sqlite3.Error:
         return exit_payload
-    existing = _json_dict(row["metadata"] if row is not None else None)
+    existing = _kb._json_dict(row["metadata"] if row is not None else None)
     if not existing:
         return exit_payload
     merged = dict(existing)
@@ -2993,19 +2969,6 @@ def _merge_run_metadata(conn: sqlite3.Connection, task_id: str, exit_payload: di
         merged["requested_model"] = existing.get("model")
     merged.update(exit_payload)
     return merged
-
-
-def _json_dict(raw) -> dict:
-    """Parsed JSON object from a metadata column, or {} when absent/unparseable."""
-    if not raw:
-        return {}
-    try:
-        import json
-
-        parsed = json.loads(raw)
-    except Exception:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
@@ -3022,9 +2985,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
 
     # Distribution decision for THIS spawn. Best-effort: any failure leaves
     # ``route`` None and the worker falls back to the profile config, so a
-    # resolution bug can never stop a card from spawning.
+    # resolution bug can never stop a card from spawning. ``board`` is threaded
+    # through because the shared tally is read from that board's DB.
     try:
-        route, route_reasons = resolve_task_route(task, skip=_requeue_failover_skip(task))
+        route, route_reasons = resolve_task_route(
+            task, skip=_requeue_failover_skip(task, board=board), board=board)
     except Exception as exc:
         route, route_reasons = None, [f"route resolution failed: {exc}"]
 
@@ -3176,7 +3141,7 @@ def _record_route_decision(task: Task, route: Optional[ProviderRoute], reasons: 
         from hermes_cli import kanban_db_connect as _kbc
 
         demoted = sorted(
-            {f"{p}/{m}" for p, m in walled_routes()}
+            {f"{p}/{m}" for p, m in walled_routes(board=board)}
         ) if route is not None else []
         payload = {
             "provider": route.provider if route is not None else None,
@@ -3186,7 +3151,12 @@ def _record_route_decision(task: Task, route: Optional[ProviderRoute], reasons: 
             "demoted_routes": demoted,
             "pid": pid,
         }
-        with _kbc.connect() as conn, _kb.write_txn(conn):
+        # The shared tally is read fail-open, so a broken read leaves no other
+        # trace; record it where a demotion would have been attributed.
+        tally_error = shared_wall_read_error()
+        if tally_error:
+            payload["wall_tally_error"] = tally_error
+        with _kbc.connect(board=board) as conn, _kb.write_txn(conn):
             conn.execute(
                 "UPDATE task_runs SET metadata = ? "
                 "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?) "
