@@ -97,7 +97,8 @@ Durable SQLite-backed board letting multiple profiles/workers collaborate. Users
 zero outside a kanban task (footprint ladder rung 3).
 
 - **CLI:** `hermes_cli/kanban.py` facade + 14 `kanban_*.py` siblings (`boards`, `db`, `db_connect`,
-  `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
+  `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `db_paths` (board
+  path resolution + `isolated_board`), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
   notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
@@ -117,7 +118,11 @@ zero outside a kanban task (footprint ladder rung 3).
 
 Isolation: **board** is the hard boundary — workers get `HERMES_KANBAN_BOARD` pinned in their env and
 cannot see other boards; **tenant** is a soft namespace within a board (workspace-path + memory-key
-isolation, one fleet serving several businesses). After `kanban.failure_limit` consecutive
+isolation, one fleet serving several businesses). Board paths resolve in
+`hermes_cli/kanban_db_paths.py` (the `kanban_db` facade re-exports them); `HERMES_KANBAN_HOME`
+alone cannot isolate a board — the `HERMES_KANBAN_DB` pin outranks it and is injected into every
+worker — so use `kanban_db.isolated_board()`, which sets the home and clears every pin together and
+raises `KanbanBoardPinConflict` when a pin contradicts an explicitly-set home. After `kanban.failure_limit` consecutive
 non-success attempts on a task (default 2) the dispatcher auto-blocks it to stop spin loops; a
 worker exit of `KANBAN_TERMINAL_PROVIDER_EXIT_CODE` (78 — credential revoked, model gone; the
 worker's own `failure_reason` classification via `cli._TERMINAL_PROVIDER_REASONS`) trips it on
