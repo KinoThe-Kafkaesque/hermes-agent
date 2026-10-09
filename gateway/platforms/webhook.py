@@ -38,7 +38,9 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.tcp_site import start_tcp_site
-from gateway.platforms.webhook_coalesce import WebhookCoalescer, validate_coalesce_config
+from gateway.platforms.webhook_coalesce import (
+    WebhookCoalescer, validate_coalesce_config, validate_session_identity_config,
+)
 from gateway.platforms.webhook_filters import DEFAULT_SCRIPT_TIMEOUT_SECONDS, WebhookRouteProcessor
 from gateway.response_filters import is_autonomous_silence_response
 
@@ -73,25 +75,64 @@ _GH_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
 
 @dataclass(frozen=True)
 class _WebhookDeliveryIdentity:
-    """Collision-free identity for one provider delivery on one routed webhook route."""
+    """Collision-free identity for one provider delivery on one routed webhook route.
+
+    ``discussion_key`` is the CONVERSATION identity, deliberately separate from ``delivery_id``
+    (the EVENT identity). A route opts in with ``session_key_from_payload: "<dotted field>"``;
+    when it does, every event whose payload resolves that field to the same value joins ONE
+    session, while dedupe still keys on the per-occurrence delivery id — so the two dimensions
+    are independent: dedupe per event, continuity per discussion (#owner-continuity).
+    """
 
     profile: str
     route: str
     delivery_id: str
+    discussion_key: Optional[str] = None
 
     @classmethod
-    def from_parts(cls, profile: Optional[str], route: str, delivery_id: str) -> "_WebhookDeliveryIdentity":
-        return cls(profile=profile or "default", route=route, delivery_id=delivery_id)
+    def from_parts(cls, profile: Optional[str], route: str, delivery_id: str,
+                   discussion_key: Optional[str] = None) -> "_WebhookDeliveryIdentity":
+        return cls(profile=profile or "default", route=route, delivery_id=delivery_id,
+                   discussion_key=discussion_key)
 
     @property
     def session_chat_id(self) -> str:
         # A versioned canonical JSON tuple avoids delimiter ambiguity while keeping the chat id safe
         # for session-key persistence even when provider-controlled fields contain ':' or '/'.
+        # With a discussion_key the delivery_id slot carries it instead, so the chat id — and hence
+        # the derived session key — is stable per discussion rather than per event.
         payload = json.dumps(
-            (self.profile, self.route, self.delivery_id), ensure_ascii=False, separators=(",", ":")
+            (self.profile, self.route, self.discussion_key or self.delivery_id),
+            ensure_ascii=False, separators=(",", ":")
         ).encode("utf-8")
         token = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
         return f"webhook:v2:{token}"
+
+
+def _discussion_key_from_payload(route_config: dict, payload: Any) -> Optional[str]:
+    """Resolve a route's ``session_key_from_payload`` dotted field against *payload*.
+
+    Returns None — meaning "per-event session, today's behavior" — whenever the route does not opt
+    in, the payload is not an object, the field is missing/blank, or resolution does not terminate
+    at a scalar. An unresolved key must never silently collapse unrelated discussions into one
+    session, which is the failure mode a per-discussion key exists to avoid.
+    """
+    field = route_config.get("session_key_from_payload")
+    if not isinstance(field, str) or not field.strip():
+        return None
+    value: Any = payload
+    for part in field.strip().split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    if isinstance(value, bool) or value is None:
+        return None
+    text = value if isinstance(value, str) else str(value)
+    text = text.strip()
+    # A template that failed to render would otherwise become a literal discussion name.
+    if not text or _TEMPLATE_KEY_RE.search(text):
+        return None
+    return text[:200]
 
 
 def _is_loopback_host(host: Optional[str]) -> bool:
@@ -242,6 +283,7 @@ class WebhookAdapter(BasePlatformAdapter):
                                  f"exclusive: deliver_only pushes the rendered template as a message, cron_job fires "
                                  f"an existing cron job (which handles its own delivery).")
         validate_coalesce_config(name, route)
+        validate_session_identity_config(name, route)
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         self._reload_dynamic_routes()
@@ -389,6 +431,7 @@ class WebhookAdapter(BasePlatformAdapter):
         try:
             # Hot-reloaded from the request handler: a malformed block must skip the route, not 500 the request.
             validate_coalesce_config(name, route)
+            validate_session_identity_config(name, route)
         except ValueError as e:
             logger.warning("[webhook] Dynamic route '%s' skipped: %s", name, e)
             return False
@@ -662,7 +705,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 prompt = self._apply_skills(prompt, skills)
         delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
             "webhook-id", headers.get("X-Request-ID", uuid.uuid4().hex))))
+        # CONVERSATION identity (opt-in, independent of the per-event delivery id used below).
+        discussion_key = _discussion_key_from_payload(route_config, payload)
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
+        # Dedupe keys on the EVENT identity only, so a stable per-discussion session never
+        # weakens idempotency: re-POSTing one occurrence is still suppressed as a duplicate.
         delivery_identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
         if not self._record_delivery_id(delivery_identity, now):
             logger.info("[webhook] Skipping duplicate delivery %s on route %s", delivery_id, route_name)
@@ -675,26 +722,30 @@ class WebhookAdapter(BasePlatformAdapter):
         coalesce = route_config.get("coalesce")
         if isinstance(coalesce, dict) and self._coalescer.enqueue(
                 route_name=route_name, coalesce=coalesce, payload=payload, event_type=event_type, prompt=prompt,
-                delivery_id=delivery_id, now=now, route_config=route_config, profile=profile):
+                delivery_id=delivery_id, now=now, route_config=route_config, profile=profile,
+                discussion_key=discussion_key):
             return web.json_response({"status": "coalesced", "route": route_name, "event": event_type,
                                       "delivery_id": delivery_id}, status=202)
         return self._dispatch_agent_run(request, route_config, route_name, profile, payload, prompt, event_type,
-                                        delivery_id, now)
+                                        delivery_id, now, discussion_key=discussion_key)
 
     def _dispatch_agent_run(self, request, route_config: dict, route_name: str, profile, payload: Any, prompt: str,
-                            event_type: str, delivery_id: str, now: float) -> "web.Response":
+                            event_type: str, delivery_id: str, now: float,
+                            discussion_key: Optional[str] = None) -> "web.Response":
         """Spawn the agent run for one POST and return 202 immediately."""
-        logger.info("[webhook] %s event=%s route=%s prompt_len=%d delivery=%s", request.method, event_type, route_name,
-                    len(prompt), delivery_id)
+        logger.info("[webhook] %s event=%s route=%s prompt_len=%d delivery=%s%s", request.method, event_type,
+                    route_name, len(prompt), delivery_id,
+                    f" discussion={discussion_key}" if discussion_key else "")
         self._spawn_agent_run(payload, prompt, delivery_id, now, route_config=route_config, route_name=route_name,
-                              profile=profile, event_type=event_type)
+                              profile=profile, event_type=event_type, discussion_key=discussion_key)
         return web.json_response({"status": "accepted", "route": route_name, "event": event_type,
                                   "delivery_id": delivery_id}, status=202)
 
     def _spawn_agent_run(self, payload: Any, prompt: str, delivery_id: str, now: float, *, route_config: dict,
-                         route_name: str, profile, event_type: str) -> "asyncio.Task":
+                         route_name: str, profile, event_type: str,
+                         discussion_key: Optional[str] = None) -> "asyncio.Task":
         """Record delivery info and fire the agent run (shared by the immediate and coalesced paths)."""
-        identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id)
+        identity = _WebhookDeliveryIdentity.from_parts(profile, route_name, delivery_id, discussion_key)
         session_chat_id = identity.session_chat_id
         # ``profile`` rides along so the reply leg (``send`` → ``_deliver_cross_platform``) egresses through
         # THIS profile's adapter, home channel and secrets — not the first profile that has the platform.
@@ -702,7 +753,10 @@ class WebhookAdapter(BasePlatformAdapter):
             "deliver": route_config.get("deliver", "log"), "profile": profile,
             "deliver_extra": self._render_delivery_extra(route_config.get("deliver_extra", {}), payload),
             "route": route_name,
-            "mirror": route_config.get("mirror_to_session") is True}
+            "mirror": route_config.get("mirror_to_session") is True,
+            # Per-discussion sessions are reused across deliveries, so the per-delivery close in
+            # ``on_processing_complete`` must be skipped or every wake would re-end the shared row.
+            "keep_session_open": bool(route_config.get("keep_session_open")) and discussion_key is not None}
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
         self._prune_delivery_info(now)
@@ -722,7 +776,21 @@ class WebhookAdapter(BasePlatformAdapter):
     async def on_processing_complete(self, event: "MessageEvent", outcome: Any) -> None:
         """Close the one-shot per-delivery session: ``prune_sessions`` only reaps rows with ``ended_at`` set, so
         unclosed webhook sessions leak unbounded. Fires at the true end of the run; ``end_session()`` is
-        first-reason-wins."""
+        first-reason-wins.
+
+        Skipped for routes that opt into ``keep_session_open`` — a CONTINUING discussion (one session reused
+        across deliveries via ``session_key_from_payload``). Ending it here is what makes a recurring session
+        key mint a cold session per wake: ``webhook_complete`` is not in ``_RECOVERABLE_END_REASONS``
+        (hermes_state_common.py), so the next delivery's ``get_or_create_session`` finds the route stale and
+        creates a fresh row. Leaving it open is precisely what lets the next wake resume this conversation.
+
+        Bound: an ever-open session is reaped by the ordinary idle-sweep policy rather than here, which is the
+        same treatment a DM session gets.
+        """
+        info = self._delivery_info.get(event.source.chat_id) or {}
+        if info.get("keep_session_open"):
+            logger.debug("[webhook] Keeping per-discussion session open for %s", event.source.chat_id)
+            return
         await self._end_webhook_session(event, event.source.chat_id)
 
     async def _end_webhook_session(self, event: "MessageEvent", session_chat_id: str) -> None:

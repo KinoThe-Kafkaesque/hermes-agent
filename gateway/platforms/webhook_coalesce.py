@@ -24,6 +24,24 @@ DEFAULT_MAX_WAIT_SECONDS = 300.0
 _PLACEHOLDER_RE = re.compile(r"\{[a-zA-Z0-9_.]+\}")
 
 
+def validate_session_identity_config(route_name: str, route: dict) -> None:
+    """Validate a route's per-discussion session identity keys.
+
+    Separate from :func:`validate_coalesce_config` and called for EVERY route: session identity is
+    meaningful without coalescing (a debounce is one thing, continuity another), so a coalesce-less
+    route must still fail fast on a typo'd ``session_key_from_payload``.
+    """
+    session_field = route.get("session_key_from_payload")
+    if session_field is not None and (not isinstance(session_field, str) or not session_field.strip()):
+        raise ValueError(f"[webhook] Route '{route_name}' has session_key_from_payload={session_field!r}; it must be "
+                         f"a non-empty dotted payload field (e.g. 'assignee') or omitted.")
+    if route.get("keep_session_open") and not (isinstance(session_field, str) and session_field.strip()):
+        # Keeping the per-delivery session open only makes sense when one session is deliberately shared
+        # across deliveries; without a discussion key it would leak a one-shot session per event.
+        raise ValueError(f"[webhook] Route '{route_name}' sets keep_session_open without session_key_from_payload. "
+                         f"keep_session_open requires a discussion key, else every event leaks its own open session.")
+
+
 def validate_coalesce_config(route_name: str, route: dict) -> None:
     """Startup validation of a route's ``coalesce`` block; raises ValueError so a typo'd route fails
     fast instead of silently dispatching every event. Agent-mode routes only."""
@@ -88,7 +106,8 @@ class WebhookCoalescer:
         return f"{route_name}|{rendered}"
 
     def enqueue(self, *, route_name: str, coalesce: dict, payload: dict, event_type: str, prompt: str,
-                delivery_id: str, now: float, **dispatch_kwargs) -> bool:
+                delivery_id: str, now: float, discussion_key: Optional[str] = None,
+                **dispatch_kwargs) -> bool:
         """Buffer one event; False when the key did not resolve and the caller must dispatch immediately."""
         group_key = self.group_key(route_name, coalesce["key"], payload, event_type)
         if group_key is None:
@@ -100,7 +119,8 @@ class WebhookCoalescer:
         existing = self._pending.get(group_key)
         first_at = existing.first_at if existing else now
         count = existing.count + 1 if existing else 1
-        dispatch_kwargs = {**dispatch_kwargs, "route_name": route_name, "event_type": event_type}
+        dispatch_kwargs = {**dispatch_kwargs, "route_name": route_name, "event_type": event_type,
+                           "discussion_key": discussion_key}
         self._pending[group_key] = PendingEvent(payload=payload, prompt=prompt, delivery_id=delivery_id,
                                                 first_at=first_at, count=count, dispatch_kwargs=dispatch_kwargs)
         if existing is not None:
