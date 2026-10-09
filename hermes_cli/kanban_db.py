@@ -3270,12 +3270,23 @@ def edit_task(
     body: Optional[str] = None, priority: Optional[int] = None,
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
+    goal_mode: Optional[bool] = None, goal_max_turns: Optional[int] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields, optionally backfilling a completed task's result.
+
+    ``goal_mode``/``goal_max_turns`` let an operator (or the unblock path) BUMP a
+    card that exhausted the single-shot iteration budget into a goal loop without
+    re-creating it: the next dispatch spawns a goal worker instead of a classic
+    one-shot. ``goal_mode=None`` leaves the column untouched.
+    """
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
     ]
+    if goal_mode is not None:
+        changed_fields.append("goal_mode")
+    if goal_max_turns is not None:
+        changed_fields.append("goal_max_turns")
     with write_txn(conn):
         status = _task_status(conn, task_id)
         if status is None or (result is not None and status != "done"):
@@ -3286,6 +3297,12 @@ def edit_task(
             if value is not None:
                 assignments.append(f"{field} = ?")
                 params.append(value)
+        if goal_mode is not None:
+            assignments.append("goal_mode = ?")
+            params.append(1 if goal_mode else 0)
+        if goal_max_turns is not None:
+            assignments.append("goal_max_turns = ?")
+            params.append(int(goal_max_turns))
         if result is not None:
             assignments.append("result = ?")
             params.append(result)
