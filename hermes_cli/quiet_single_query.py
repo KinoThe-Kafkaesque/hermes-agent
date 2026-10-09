@@ -26,8 +26,62 @@ _MAX_QUIET_NOTIFY_ROUNDS = 8
 # ``hermes kanban dispatch`` process never reaped the worker, so ``os.waitpid`` cannot tell it how
 # the worker exited; the trailer is the process-independent witness the dead-worker sweep reads
 # instead, so a clean exit without a terminal board call is booked as the same protocol violation
-# (and a 75 as the same rate-limit requeue) whichever process notices the death.
+# (and a 75 as the same rate-limit requeue) whichever process notices the death. The optional
+# ``provider=``/``model=`` fields carry the route that served the run so a wall is attributable to
+# a named provider instead of only an exit code (see ``kanban_provider_distribution``).
 KANBAN_WORKER_EXIT_TRAILER = "[kanban-worker-exit] rc="
+
+
+def _active_inference_route() -> "tuple[str, str]":
+    """``(provider, model)`` this process actually resolved its agent onto.
+
+    The CLI instance is a function-local in ``cli.main`` with no module-level
+    singleton, so the caller passes it through ``_EXIT_TRAILER_CLI`` (set by the
+    one-shot drivers before they exit); ``cli._active_agent_ref`` is the fallback
+    for paths that publish it.
+
+    Read from the live agent when there is one: a fallback swap replaces
+    ``agent.provider``/``agent.model``, and the SERVING route is what a quota wall
+    is about, not the requested one. Empty strings when nothing is reachable — an
+    unnamed route is recorded as unknown rather than guessed.
+    """
+    for holder in (_EXIT_TRAILER_CLI, ):
+        if holder is None:
+            continue
+        agent = getattr(holder, "agent", None)
+        if agent is not None:
+            return (
+                str(getattr(agent, "provider", "") or "").strip(),
+                str(getattr(agent, "model", "") or "").strip(),
+            )
+        return (
+            str(getattr(holder, "provider", "") or "").strip(),
+            str(getattr(holder, "model", "") or "").strip(),
+        )
+    try:
+        import cli as _cli
+
+        agent = getattr(_cli, "_active_agent_ref", None)
+        if agent is not None:
+            return (
+                str(getattr(agent, "provider", "") or "").strip(),
+                str(getattr(agent, "model", "") or "").strip(),
+            )
+    except Exception:
+        pass
+    return "", ""
+
+
+# Set by the one-shot drivers to the live CLI so the exit trailer can name the
+# route that served the run. Weakly-held by convention: the drivers overwrite it
+# per invocation, and it is only ever READ at process exit.
+_EXIT_TRAILER_CLI = None
+
+
+def bind_exit_trailer_cli(cli: Any) -> None:
+    """Publish the CLI whose route the next ``exit_single_query`` should report."""
+    global _EXIT_TRAILER_CLI
+    _EXIT_TRAILER_CLI = cli
 
 
 def exit_single_query(code: int) -> None:
@@ -36,7 +90,13 @@ def exit_single_query(code: int) -> None:
         with contextlib.suppress(Exception):
             # stderr: stdout may be the ``--stream-json`` record stream, and the worker log
             # captures both streams.
-            print(f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}", file=sys.stderr, flush=True)
+            from hermes_cli.kanban_provider_distribution import trailer_fields
+
+            provider, model = _active_inference_route()
+            print(
+                f"\n{KANBAN_WORKER_EXIT_TRAILER}{int(code)}{trailer_fields(provider, model)}",
+                file=sys.stderr, flush=True,
+            )
     sys.exit(code)
 
 

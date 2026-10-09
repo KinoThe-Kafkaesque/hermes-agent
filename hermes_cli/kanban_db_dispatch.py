@@ -25,6 +25,17 @@ from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
 
+from hermes_cli.kanban_provider_distribution import (  # noqa: F401 — re-exported for callers/tests
+    ProviderRoute,
+    build_chain,
+    normalize_route,
+    parse_exit_trailer,
+    record_rate_limit,
+    select_route,
+    strip_exit_trailer,
+    walled_route_details,
+    walled_routes,
+)
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
 if TYPE_CHECKING:
@@ -262,6 +273,28 @@ _EXIT_TRAILER_RE = re.compile(
 )
 
 
+def _worker_log_exit_trailer(task_id: str, board: Optional[str] = None):
+    """``(exit_code, provider, model)`` from the trailer the worker CLI wrote to its own log;
+    all None when absent.
+
+    The durable twin of ``_recent_worker_exits``: written by the worker itself
+    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
+    or not the process running this sweep ever reaped the worker. Last trailer
+    wins — the log is append-mode across re-runs. The provider/model fields are
+    optional and absent from an older worker binary, which parses fine: the rc is
+    the load-bearing field and an unnamed route records as unknown rather than
+    failing the classification.
+    """
+    try:
+        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
+    except Exception:
+        return None, None, None
+    trailer = parse_exit_trailer(raw)
+    if trailer is None:
+        return None, None, None
+    return trailer.exit_code, trailer.provider, trailer.model
+
+
 def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
     """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
 
@@ -270,12 +303,8 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     or not the process running this sweep ever reaped the worker. Last trailer
     wins — the log is append-mode across re-runs.
     """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return None
-    matches = _EXIT_TRAILER_RE.findall(raw or "")
-    return int(matches[-1]) if matches else None
+    code, _provider, _model = _worker_log_exit_trailer(task_id, board=board)
+    return code
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1010,7 +1039,7 @@ def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
         return ""
     if not raw:
         return ""
-    raw = _EXIT_TRAILER_RE.sub("", raw)
+    raw = strip_exit_trailer(raw)
     cut = raw.rfind(_exit_summary_marker())
     if cut != -1:
         raw = raw[:cut]
@@ -1034,6 +1063,12 @@ class _DeadWorker:
     protocol_violation: bool = False
     rate_limited: bool = False
     terminal_provider: bool = False
+    # ``(provider, model)`` the worker reported serving this run, or None when it
+    # named none (older binary, or killed before its exit epilogue). Recorded on
+    # EVERY outcome's payload so "which provider served this card" is answerable
+    # after the fact — the input demotion-on-quota-wall needs.
+    provider: Optional[str] = None
+    model: Optional[str] = None
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
 
@@ -1042,6 +1077,18 @@ class _DeadWorker:
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
         return "rate_limited" if self.rate_limited else "crashed"
+
+    @property
+    def route(self) -> Optional[ProviderRoute]:
+        """The serving route as a normalized identity, or None when unnamed."""
+        return normalize_route(self.provider, self.model)
+
+    def with_route(self, provider: Optional[str], model: Optional[str]) -> "_DeadWorker":
+        """Attach the observed serving route to the payload (both fields, once)."""
+        self.provider, self.model = provider, model
+        self.event_payload["provider"] = provider
+        self.event_payload["model"] = model
+        return self
 
 
 def _classify_dead_worker(
@@ -1078,8 +1125,9 @@ def _classify_dead_worker_exit(
     epilogue (killed, OOM) leaves no trailer and stays a plain crash.
     """
     kind, code = _classify_worker_exit(pid)
+    trailer_provider = trailer_model = None
     if kind == "unknown" and task_id:
-        logged = _worker_log_exit_code(task_id, board=board)
+        logged, trailer_provider, trailer_model = _worker_log_exit_trailer(task_id, board=board)
         if logged is not None:
             kind, code = _exit_code_kind(logged)
     if kind == "clean_exit":
@@ -1093,17 +1141,25 @@ def _classify_dead_worker_exit(
             # run metadata.
             {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
             protocol_violation=True,
-        )
+        ).with_route(trailer_provider, trailer_model)
     if kind == "rate_limited":
         # Quota wall — NOT a task failure. Release to the source phase and do
         # NOT count a failure so a long quota window can't trip the breaker.
-        return _DeadWorker(
+        dead = _DeadWorker(
             kind, code,
             f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
-        )
+        ).with_route(trailer_provider, trailer_model)
+        # Feed the demotion tally: the next spawn of this card (and of any other
+        # card on the same route) prefers the next healthy provider instead of
+        # re-hitting the wall. Only when the trailer NAMED the route — an
+        # unnamed wall cannot be attributed and must not demote anything.
+        route = dead.route
+        if route is not None:
+            dead.event_payload["wall_count"] = record_rate_limit(route.provider, route.model)
+        return dead
     if kind == "terminal_provider":
         # The worker classified its own provider failure as unhealable (credential
         # revoked, model gone): every further spawn would hit the same wall, so
@@ -1115,7 +1171,7 @@ def _classify_dead_worker_exit(
             "crashed",
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
             terminal_provider=True,
-        )
+        ).with_route(trailer_provider, trailer_model)
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1126,7 +1182,8 @@ def _classify_dead_worker_exit(
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
         event_payload["exit_code"] = code
-    return _DeadWorker(kind, code, error_text, "crashed", event_payload)
+    return _DeadWorker(kind, code, error_text, "crashed", event_payload).with_route(
+        trailer_provider, trailer_model)
 
 
 @dataclass
@@ -1182,7 +1239,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 conn, row["id"],
                 outcome=dead.run_outcome, status=dead.run_outcome,
                 error=dead.error_text,
-                metadata=dict(dead.event_payload),
+                # Merge over the spawn-time route attribution rather than
+                # replacing it: the exit payload names the OBSERVED route, and
+                # the spawn record names what was REQUESTED (plus the demotions
+                # that produced it). Losing the latter would make a demotion
+                # unattributable after the fact.
+                metadata=_merge_run_metadata(conn, row["id"], dict(dead.event_payload)),
             )
             _kb._append_event(conn, row["id"], dead.event_kind, dead.event_payload, run_id=run_id)
             sweep.exited_hook_payloads.append({
@@ -2740,8 +2802,34 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+def resolve_task_route(task: Task, *, skip: Optional[set] = None) -> "tuple[Optional[ProviderRoute], list[str]]":
+    """``(route, reasons)`` a card should START on, with distribution applied.
+
+    An explicit per-card pin (``model_override``/``provider_override``) always
+    wins and is never demoted — the operator chose that route. Otherwise the
+    chain is the profile's primary plus its ``fallback_providers`` and the
+    default distribution tail, and ``select_route`` walks past any provider over
+    its rate-limit threshold (demotion) and any route this card already failed
+    over away from (sticky advance on requeue). ``reasons`` explains the choice
+    for the run metadata and the log.
+    """
+    pinned = normalize_route(task.provider_override, task.model_override)
+    if pinned is not None:
+        return pinned, [f"pinned by card: {pinned.describe()}"]
+    chain = build_chain(task.assignee, None)
+    if not chain:
+        return None, ["no provider route resolved; worker uses the profile config"]
+    return select_route(chain, skip=skip)
+
+
+def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str],
+                 route: Optional[ProviderRoute] = None) -> list[str]:
+    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command.
+
+    *route* is the distribution decision for this spawn: passed as ``-m``/``--provider``
+    so the worker actually runs on it. Without it the worker resolves its own model
+    from the profile config, exactly as before this feature.
+    """
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -2764,10 +2852,19 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # intended backend (model X with provider Y is the classic board-stall).
         if task.provider_override:
             cmd.extend(["--provider", task.provider_override])
+    elif route is not None:
+        # No explicit pin: the distribution decision rides the same seam. This is
+        # what makes a card actually START on the chosen provider — without it
+        # the worker reads the profile config and the decision is inert.
+        cmd.extend(["-m", route.model])
+        if route.provider:
+            cmd.extend(["--provider", route.provider])
     # Independent of the model override — a task can run the profile's own
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
+    elif route is not None and route.reasoning and not task.model_override:
+        cmd.extend(["--reasoning", route.reasoning])
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -2828,6 +2925,89 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
+def _requeue_failover_skip(task: Task) -> set:
+    """Routes this card should NOT restart on after a ``rate_limited`` requeue.
+
+    Reads the latest closed run's recorded provider/model. Sticky-advance, not
+    random: a genuinely-walled provider is skipped rather than retried into the
+    same wall, and the advance is bounded (one route) so a card that keeps
+    walling walks its chain forward rather than thrashing.
+    """
+    if task.current_run_id is None:
+        return set()
+    meta = _latest_run_metadata(task.id)
+    if meta.get("outcome") != "rate_limited":
+        return set()
+    route = normalize_route(meta.get("provider"), meta.get("model"))
+    return {route.identity} if route is not None else set()
+
+
+def _latest_run_metadata(task_id: str) -> dict:
+    """``{outcome, provider, model, ...}`` of the latest CLOSED run; {} when none.
+
+    ``provider``/``model`` fall back through both writers: the observed route the
+    worker reported at exit, then the route the spawn requested.
+    """
+    try:
+        from hermes_cli import kanban_db_connect as _kbc
+
+        with _kbc.connect() as conn:
+            row = conn.execute(
+                "SELECT outcome, metadata FROM task_runs WHERE task_id = ? "
+                "AND ended_at IS NOT NULL ORDER BY ended_at DESC, id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+    except Exception:
+        return {}
+    if row is None:
+        return {}
+    meta = dict(_json_dict(row["metadata"]) or {})
+    meta["outcome"] = row["outcome"]
+    if not meta.get("provider") and meta.get("requested_provider"):
+        meta["provider"] = meta["requested_provider"]
+        meta["model"] = meta.get("requested_model") or meta.get("model")
+    return meta
+
+
+def _merge_run_metadata(conn: sqlite3.Connection, task_id: str, exit_payload: dict) -> dict:
+    """Exit payload merged over the run's existing spawn-time metadata.
+
+    Caller holds the write txn. Keys already in *exit_payload* win (the observed
+    route is authoritative); the spawn record's request-side keys survive under
+    ``requested_*`` so "what we asked for" and "what served it" are both readable.
+    """
+    try:
+        row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = "
+            "(SELECT current_run_id FROM tasks WHERE id = ?) AND ended_at IS NULL",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return exit_payload
+    existing = _json_dict(row["metadata"] if row is not None else None)
+    if not existing:
+        return exit_payload
+    merged = dict(existing)
+    if existing.get("provider") and "provider" not in exit_payload:
+        merged["requested_provider"] = existing.get("provider")
+        merged["requested_model"] = existing.get("model")
+    merged.update(exit_payload)
+    return merged
+
+
+def _json_dict(raw) -> dict:
+    """Parsed JSON object from a metadata column, or {} when absent/unparseable."""
+    if not raw:
+        return {}
+    try:
+        import json
+
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -2839,6 +3019,14 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     """
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    # Distribution decision for THIS spawn. Best-effort: any failure leaves
+    # ``route`` None and the worker falls back to the profile config, so a
+    # resolution bug can never stop a card from spawning.
+    try:
+        route, route_reasons = resolve_task_route(task, skip=_requeue_failover_skip(task))
+    except Exception as exc:
+        route, route_reasons = None, [f"route resolution failed: {exc}"]
 
     from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
 
@@ -2937,7 +3125,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), route)
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
@@ -2969,7 +3157,44 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:
         _live_worker_procs[proc.pid] = proc
+    _record_route_decision(task, route, route_reasons, pid=proc.pid, board=board)
     return proc.pid
+
+
+def _record_route_decision(task: Task, route: Optional[ProviderRoute], reasons: list[str], *,
+                           pid: Optional[int] = None, board: Optional[str] = None) -> None:
+    """Stamp the distribution decision onto the run row so it is answerable later.
+
+    Written best-effort inside its own txn: the worker is already launched, and
+    observability must never be the reason a spawn fails. ``demoted`` names the
+    routes that were skipped for this spawn, which is what makes a demotion
+    auditable instead of a silent model swap.
+    """
+    if route is None and not reasons:
+        return
+    try:
+        from hermes_cli import kanban_db_connect as _kbc
+
+        demoted = sorted(
+            {f"{p}/{m}" for p, m in walled_routes()}
+        ) if route is not None else []
+        payload = {
+            "provider": route.provider if route is not None else None,
+            "model": route.model if route is not None else None,
+            "reasoning_effort": route.reasoning if route is not None else None,
+            "route_reasons": reasons,
+            "demoted_routes": demoted,
+            "pid": pid,
+        }
+        with _kbc.connect() as conn, _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET metadata = ? "
+                "WHERE id = (SELECT current_run_id FROM tasks WHERE id = ?) "
+                "AND ended_at IS NULL",
+                (_kb._json_or_null(payload), task.id),
+            )
+    except Exception as exc:
+        _kb._log.debug("kanban dispatch: route attribution for %s skipped (%s)", task.id, exc)
 
 
 # ---------------------------------------------------------------------------
