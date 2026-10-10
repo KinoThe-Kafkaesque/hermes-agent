@@ -111,6 +111,7 @@ _GUARDS = {
     "case-collisions": ["scripts/check-case-collisions.py"],
     "lazy-deps": ["scripts/ci/check_lazy_deps_imports.py"],
     "profile-archives": ["scripts/ci/check_profile_archive_boundary.py"],
+    "partial-index-where": ["scripts/ci/check_partial_index_where.py"],
 }
 _CHECKS = (*_GUARDS, "ruff", "health")
 

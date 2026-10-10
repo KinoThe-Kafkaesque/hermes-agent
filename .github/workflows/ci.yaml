@@ -268,6 +268,11 @@ jobs:
     needs: detect
     uses: ./.github/workflows/lazy-deps-guard.yml
 
+  partial-index-where-guard:
+    name: No partial index compares a column to a literal
+    needs: detect
+    uses: ./.github/workflows/partial-index-where-guard.yml
+
   lockfile-diff:
     name: package-lock.json diff
     needs: detect
@@ -326,6 +331,7 @@ jobs:
       - infographic-check
       - case-collision-check
       - lazy-deps-guard
+      - partial-index-where-guard
       - lockfile-diff
       - docker-lint
       - profile-artifact-check
