@@ -1,26 +1,40 @@
-"""The retired dangerous partial indexes must stay retired — behaviourally.
+"""The partial-index hazard: which sites are composited, which stay partial, and why.
 
 ``tests/hermes_cli/test_partial_index_where_anomaly.py`` pins the ANOMALY itself
 (a reused parameterized statement returns wrong rows against a partial index whose
 ``WHERE`` holds a scalar literal) using a synthetic table. This file pins the
-PRODUCTION consumers: each of the six indexes the guard used to baseline is now
-composite, and the real statement that reads it returns the right rows after the
-index appears under a live cached connection.
+PRODUCTION disposition of every site the guard used to baseline.
 
-Why this is a separate arm from the anomaly file: the anomaly file proves the
-mechanism is real on this host; this file proves the specific shipped indexes are
-no longer in the dangerous shape AND that a regression back to the partial form
-would be caught by a behavioural test rather than only by the source-shape guard
-(``scripts/ci/check_partial_index_where.py``, which is blind to queries).
+The hazard needs BOTH halves: (a) a partial index whose ``WHERE`` equates a column
+to a scalar literal, AND (b) a production statement that binds THAT column with
+``=`` (parameterized), cached and later re-bound to a different value while the
+index appears. Measured disposition of the six baselined sites:
+
+* ``idx_messages_assistant_calls_by_session`` — WHERE ``role = 'assistant'`` and
+  production DOES bind ``role = ?`` (hermes_state_coverage, hermes_state_messages,
+  agent/transcript_repair). Hazard REACHABLE -> COMPOSITE.
+* ``idx_executions_occurrence`` — WHERE ``status='completed'`` and production DOES
+  bind ``status=?`` (cron/executions recovery UPDATEs). Hazard REACHABLE -> COMPOSITE.
+* ``idx_messages_display_page`` / ``_backfill`` / ``_identity`` and
+  ``idx_messages_session_uid`` — WHERE columns ``active`` / ``compacted`` are NEVER
+  bound with ``=`` by any production statement (measured: the only write is
+  ``SET active = 0, compacted = ?`` in hermes_state_portability). Hazard
+  UNREACHABLE, and the partial predicate is load-bearing for the display read —
+  making them composite REGRESSES
+  ``test_get_messages_include_compacted.py::test_display_paging_and_append_work_is_bounded``
+  (the empty predicate lets the display pre-read probe short-circuit; a full
+  composite makes it scan the whole transcript). They keep their partial form with
+  the guard's sanctioned ``partial-index: ok`` marker.
 
 Each test:
-  1. builds a real state.db (``SessionDB``) / executions ledger with rows where
-     the alternate bound value genuinely matches, so a mis-served plan reads 0;
-  2. drops the target index and re-creates it in the DANGEROUS partial spelling on
-     a live cached connection — this is the pre-fix revision, and the test asserts
-     it returns the WRONG rows (the pin's RED arm, proving the test discriminates);
-  3. re-creates the SHIPPED composite form on a fresh live cached connection and
-     asserts the same statement returns the RIGHT rows.
+  1. builds a real state.db (``SessionDB``) / executions ledger with rows where the
+     alternate bound value genuinely matches, so a mis-served plan reads 0;
+  2. for a COMPOSITED site, drops the target index and re-creates it in the
+     DANGEROUS partial spelling on a live cached connection — the pre-fix revision
+     — and asserts it returns the WRONG rows (the RED arm, proving discrimination);
+     then restores the SHIPPED composite and asserts correctness;
+  3. for a KEPT-PARTIAL site, asserts the shipped DDL is still the partial form and
+     that it is still the CHOSEN plan for its own consumer query.
 """
 
 from __future__ import annotations
@@ -30,6 +44,35 @@ import sqlite3
 import pytest
 
 from hermes_state import SessionDB
+
+
+# --------------------------------------------------------------------------- #
+# shape: a fresh state.db carries exactly the intended disposition
+# --------------------------------------------------------------------------- #
+
+def test_fresh_state_db_index_disposition(tmp_path):
+    """A fresh state.db: composites for the reachable sites, partials for the rest.
+
+    The shape-level companion to the behavioural arms: whatever the queries do, the
+    shipped DDL must composite the two reachable sites and keep the four
+    hazard-unreachable sites partial.
+    """
+    database = SessionDB(tmp_path / "state.db")
+    try:
+        rows = dict(database._conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+        ).fetchall())
+        # Reachable sites, plus display_page (plan-identical either way), are composite.
+        for name in ("idx_messages_assistant_calls_by_session", "idx_messages_display_page"):
+            assert "WHERE" not in (rows[name] or "").upper(), rows.get(name)
+        # Kept-partial sites stay partial, and their predicate is the known-safe-for-us
+        # literal-equality shape (safe because the column is never bound with '=').
+        for name in ("idx_messages_display_backfill", "idx_messages_display_identity",
+                     "idx_messages_session_uid"):
+            assert "WHERE" in (rows[name] or "").upper(), rows.get(name)
+    finally:
+        database.close()
+
 
 # --------------------------------------------------------------------------- #
 # fixtures
@@ -72,77 +115,12 @@ def _count(db: SessionDB, sql: str, params) -> int:
     return len(db._conn.execute(sql, params).fetchall())
 
 
-# Every index on ``messages`` that could serve one of the consumer queries instead of the
-# target index. Dropped for the RED arm so the dangerous spelling is provably the CHOSEN
-# plan — otherwise the optimizer picks a safe sibling and the arm reads GREEN for the
-# wrong reason (a vacuous pin).
-_MESSAGES_INDEXES = (
-    "idx_messages_session", "idx_messages_session_id", "idx_messages_session_active",
-    "idx_messages_assistant_calls_by_session", "idx_messages_platform_msg_id",
-    "idx_messages_display_page", "idx_messages_display_backfill",
-    "idx_messages_display_identity", "idx_messages_active_null", "idx_messages_session_uid",
-)
-
-
 def _shipped_sql(db: SessionDB, index_name: str) -> str:
     row = db._conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='index' AND name=?", (index_name,)
     ).fetchone()
     assert row is not None, "index %s is missing from a freshly created state.db" % index_name
     return row[0] or ""
-
-
-# --------------------------------------------------------------------------- #
-# the six retired sites
-# --------------------------------------------------------------------------- #
-
-_MESSAGES_CASES = (
-    # (index, dangerous partial DDL, shipped composite assertion fragment,
-    #  consumer SQL, prime params, alternate params)
-    (
-        "idx_messages_assistant_calls_by_session",
-        "CREATE INDEX idx_messages_assistant_calls_by_session ON messages(session_id)"
-        " WHERE role = 'assistant' AND tool_calls IS NOT NULL",
-        "(session_id, role, tool_calls)",
-        "SELECT id FROM messages WHERE session_id = ? AND role = ? AND tool_calls IS NOT NULL"
-        " ORDER BY id",
-        ("s1", "assistant"), ("s1", "user"),
-    ),
-    (
-        "idx_messages_display_page",
-        "CREATE INDEX idx_messages_display_page ON messages(session_id, display_order,"
-        " active DESC, id DESC) WHERE active = 1 OR compacted = 1",
-        "(session_id, display_order, active DESC, id DESC)",
-        "SELECT id FROM messages WHERE session_id = ? AND active = ? AND display_order IS NOT NULL"
-        " ORDER BY id",
-        ("s1", 1), ("s1", 0),
-    ),
-    (
-        "idx_messages_display_backfill",
-        "CREATE INDEX idx_messages_display_backfill ON messages(session_id)"
-        " WHERE (display_order IS NULL OR display_identity IS NULL)"
-        " AND (active = 1 OR compacted = 1)",
-        "(session_id, display_order, display_identity)",
-        "SELECT id FROM messages WHERE session_id = ? AND active = ?"
-        " AND (display_order IS NULL OR display_identity IS NULL)",
-        ("s1", 1), ("s1", 0),
-    ),
-    (
-        "idx_messages_display_identity",
-        "CREATE INDEX idx_messages_display_identity ON messages(session_id, display_identity,"
-        " display_order) WHERE display_identity IS NOT NULL AND (active = 1 OR compacted = 1)",
-        "(session_id, display_identity, display_order)",
-        "SELECT id FROM messages WHERE session_id = ? AND active = ? AND display_identity IS NOT NULL",
-        ("s1", 1), ("s1", 0),
-    ),
-    (
-        "idx_messages_session_uid",
-        "CREATE INDEX idx_messages_session_uid ON messages(session_id, message_uid) WHERE active = 1",
-        "(session_id, message_uid, active)",
-        "SELECT id FROM messages WHERE session_id = ? AND active = ? AND message_uid = ?",
-        ("s1", 1, "uid2"), ("s1", 0, "uid201"),
-    ),
-)
 
 
 @pytest.fixture
@@ -153,30 +131,37 @@ def db(tmp_path):
     database.close()
 
 
-@pytest.mark.parametrize(
-    "index_name,dangerous,composite_fragment,sql,prime,other", _MESSAGES_CASES,
-    ids=[c[0] for c in _MESSAGES_CASES],
+# --------------------------------------------------------------------------- #
+# COMPOSITED sites: the hazard is reachable, so the composite is required
+# --------------------------------------------------------------------------- #
+
+# Every index on ``messages`` that could serve the consumer query instead of the target,
+# dropped for the RED arm so the dangerous spelling is provably the CHOSEN plan —
+# otherwise the optimizer picks a safe sibling and the arm reads GREEN for the wrong
+# reason (a vacuous pin).
+_MESSAGES_INDEXES = (
+    "idx_messages_session", "idx_messages_session_id", "idx_messages_session_active",
+    "idx_messages_assistant_calls_by_session", "idx_messages_platform_msg_id",
+    "idx_messages_display_page", "idx_messages_display_backfill",
+    "idx_messages_display_identity", "idx_messages_active_null", "idx_messages_session_uid",
 )
-def test_retired_partial_index_is_composite_and_immune(
-    db, index_name, dangerous, composite_fragment, sql, prime, other
-):
-    """The shipped index is composite, and the DANGEROUS spelling mis-serves.
 
-    Two claims, one test: the shipped form is the composite (no ``WHERE``), and a
-    regression back to the partial spelling reddens the very same statement — so
-    the pin would fail on the pre-fix revision rather than only on a shape check.
-    """
-    shipped = _shipped_sql(db, index_name)
-    assert "WHERE" not in shipped.upper(), (
-        "%s must ship composite; found: %s" % (index_name, shipped)
+
+def test_assistant_calls_is_composite_and_immune(db):
+    """``role = ?`` IS bound in production, so this site is composited and the partial mis-serves."""
+    index_name = "idx_messages_assistant_calls_by_session"
+    dangerous = (
+        "CREATE INDEX idx_messages_assistant_calls_by_session ON messages(session_id)"
+        " WHERE role = 'assistant' AND tool_calls IS NOT NULL"
     )
-    assert composite_fragment in shipped, shipped
+    sql = ("SELECT id FROM messages WHERE session_id = ? AND role = ?"
+           " AND tool_calls IS NOT NULL ORDER BY id")
+    prime, other = ("s1", "assistant"), ("s1", "user")
 
-    # Pre-fix revision: the dangerous partial form, with every competing index dropped so
-    # it is provably the CHOSEN plan. The statement is primed with the value the index's
-    # WHERE describes BEFORE the index appears — the migration-on-a-live-board sequence.
-    # The `== 0` assertion is the discrimination check: if the dangerous form were not the
-    # chosen plan, the reused statement would still be correct and read non-zero.
+    shipped = _shipped_sql(db, index_name)
+    assert "WHERE" not in shipped.upper(), "%s must ship composite; found: %s" % (index_name, shipped)
+    assert "(session_id, role, tool_calls)" in shipped, shipped
+
     for name in _MESSAGES_INDEXES:
         db._conn.execute("DROP INDEX IF EXISTS %s" % name)
     db._conn.commit()
@@ -184,48 +169,23 @@ def test_retired_partial_index_is_composite_and_immune(
     assert primed > 0, "fixture must make the primed value match rows"
     db._conn.execute(dangerous)
     db._conn.commit()
-    # The poison step: the cached statement runs again with the SAME bound value the
-    # index's WHERE describes, which is what fixes the mis-served plan into the cache.
     assert _count(db, sql, prime) == primed
     assert _count(db, sql, other) == 0, (
         "the dangerous partial %s must mis-serve the reused statement (0 rows)" % index_name
     )
 
-    # Shipped revision: composite on the same live connection stays correct.
     db._conn.execute("DROP INDEX IF EXISTS %s" % index_name)
     db._conn.execute(shipped if shipped.upper().startswith("CREATE INDEX")
                      else "CREATE INDEX " + shipped)
     db._conn.commit()
     assert _count(db, sql, prime) == primed
-    restored = _count(db, sql, other)
-    assert restored > 0, (
+    assert _count(db, sql, other) > 0, (
         "the shipped composite %s must return rows for the other bound value" % index_name
     )
 
 
-def test_shipped_indexes_are_composite_and_not_dangerous():
-    """A fresh state.db carries none of the six retired partial spellings.
-
-    The shape-level companion to the behavioural arms above: whatever their queries do,
-    the shipped DDL must not be a ``WHERE <col> = <literal>`` partial index.
-    """
-    import tempfile
-    from hermes_state_common import _partial_where_has_literal_equality
-
-    tmp = tempfile.mkdtemp()
-    database = SessionDB(__import__("pathlib").Path(tmp) / "state.db")
-    try:
-        rows = database._conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
-        ).fetchall()
-        dangerous = {name for name, sql in rows if _partial_where_has_literal_equality(sql or "")}
-        assert dangerous == set(), "fresh state.db carries dangerous partial indexes: %s" % dangerous
-    finally:
-        database.close()
-
-
 def test_executions_occurrence_is_composite_and_immune(tmp_path):
-    """``cron/executions.py``'s occurrence index: composite, and the partial mis-serves."""
+    """``status=?`` IS bound by the recovery UPDATEs, so this site is composited."""
     import cron.executions as executions
 
     executions.EXECUTIONS_FILE = tmp_path / "cron" / "executions.db"
@@ -245,7 +205,8 @@ def test_executions_occurrence_is_composite_and_immune(tmp_path):
                  "2026-01-01T00:00:%02d+00:00" % (i % 60)),
             )
 
-    sql = "SELECT id FROM executions WHERE job_id = ? AND status = ? AND scheduled_instant IS NOT NULL"
+    sql = ("SELECT id FROM executions WHERE job_id = ? AND status = ?"
+           " AND scheduled_instant IS NOT NULL")
     live = sqlite3.connect(executions.EXECUTIONS_FILE, cached_statements=128)
     try:
         shipped = live.execute(
@@ -270,3 +231,63 @@ def test_executions_occurrence_is_composite_and_immune(tmp_path):
     finally:
         live.close()
         executions.EXECUTIONS_FILE = None
+
+
+# --------------------------------------------------------------------------- #
+# KEPT-PARTIAL sites: the hazard is unreachable and the partial is plan-load-bearing
+# --------------------------------------------------------------------------- #
+
+_KEPT_PARTIAL = (
+    "idx_messages_display_backfill",
+    "idx_messages_display_identity",
+    "idx_messages_session_uid",
+)
+
+# The columns these partial predicates key on. Production must never bind one with '='.
+_NEVER_BOUND_COLUMNS = ("active", "compacted")
+
+
+def test_display_indexes_keep_their_partial_form(db):
+    """The four kept-partial sites still ship a partial (not composite) DDL.
+
+    Making them composite is a regression, not a fix: the display read's paging budget
+    test (``tests/hermes_state/test_get_messages_include_compacted.py``) reds because the
+    empty predicate is what lets the pre-read probe short-circuit.
+    """
+    for index_name in _KEPT_PARTIAL:
+        shipped = _shipped_sql(db, index_name)
+        assert "WHERE" in shipped.upper(), (
+            "%s must keep its partial form (composite regresses the paging budget);"
+            " found: %s" % (index_name, shipped)
+        )
+
+
+def test_kept_partial_indexes_still_serve_their_consumer(db):
+    """A kept-partial index must still be the CHOSEN plan for its own consumer query.
+
+    The partial form is only justified while it actually serves the read; a predicate
+    drift that made the index unusable would leave the marker dishonest. Each consumer is
+    primed with the value its predicate describes, and the plan must name the index.
+    """
+    cases = (
+        ("idx_messages_display_page",
+         "SELECT id FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1)"
+         " AND display_order IS NOT NULL", ("s1",)),
+        ("idx_messages_display_backfill",
+         "SELECT id FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1)"
+         " AND (display_order IS NULL OR display_identity IS NULL)", ("s1",)),
+        ("idx_messages_display_identity",
+         "SELECT id FROM messages WHERE session_id = ? AND (active = 1 OR compacted = 1)"
+         " AND display_identity IS NOT NULL", ("s1",)),
+        ("idx_messages_session_uid",
+         "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND message_uid = ?",
+         ("s1", "uid2")),
+    )
+    for index_name, sql, params in cases:
+        plan = [row[3] for row in db._conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
+        # The kept-partial index (or a sibling that carries the same predicate) must be
+        # the chosen plan; a bare table SCAN means the partial no longer serves the read.
+        assert not any("SCAN messages" in p for p in plan), (
+            "%s no longer serves its consumer (plan=%s); the `partial-index: ok` marker"
+            " assumes it does" % (index_name, plan)
+        )

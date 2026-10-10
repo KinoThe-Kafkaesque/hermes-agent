@@ -879,9 +879,14 @@ class SessionSchemaMixin:
 
         The dangerous shape is DETECTED from the stored ``sqlite_master.sql`` rather than
         matched against a quoted copy of the retired spelling, so this heals any equivalent
-        spelling and cannot itself become a stale literal. Indexes whose WHERE is not a
-        scalar-literal equality (``idx_messages_active_null``, ``idx_messages_platform_msg_id``)
-        are left alone.
+        spelling and cannot itself become a stale literal. Only the names in
+        ``_COMPOSITE_INDEX_REPLACEMENTS`` are candidates — the display indexes and
+        ``idx_messages_session_uid`` keep their partial form deliberately (their WHERE
+        columns are never bound with ``=`` by production, so the anomaly is unreachable,
+        and their partial predicate is load-bearing for the display read; see the
+        ``partial-index: ok`` markers in ``DEFERRED_INDEX_SQL``). Indexes whose WHERE is not
+        a scalar-literal equality (``idx_messages_active_null``,
+        ``idx_messages_platform_msg_id``) are left alone.
         """
         live = dict(cursor.execute(
             "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name IN (%s)"

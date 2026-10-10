@@ -23,13 +23,17 @@ always correct; ``PRAGMA integrity_check`` reads ``ok``; the composite
 ``website/docs/user-guide/features/kanban.md``.
 
 What this check refuses is the SHAPE, not a measured instance. The live tree no
-longer carries any such site: the six it shipped with were retired by replacing
-each partial index with its composite form (``hermes_state_common.py``,
-``cron/executions.py``, and the ``_heal_dangerous_partial_indexes`` migration that
-retires the old spelling on an already-open state.db). ``_BASELINE`` stays as the
-mechanism — ``scripts/check_no_tmp_literals.py``'s shape — so a future file that
-GAINS a hit fails, and a stale/overstated entry is reported as an advisory rather
-than turning CI red for a parallel clean-up.
+longer carries any UNMARKED such site: each was either replaced with its composite
+form (``hermes_state_common.py``'s ``idx_messages_assistant_calls_by_session``,
+``cron/executions.py``'s ``idx_executions_occurrence``, and the
+``_heal_dangerous_partial_indexes`` migration that retires the old spelling on an
+already-open state.db) or, where the partial predicate is load-bearing for a
+production read AND the column is never bound with ``=``, kept partial with the
+sanctioned ``partial-index: ok`` marker (the display indexes and
+``idx_messages_session_uid`` — see the note in ``DEFERRED_INDEX_SQL``). ``_BASELINE``
+stays as the mechanism — ``scripts/check_no_tmp_literals.py``'s shape — so a future
+file that GAINS a hit fails, and a stale/overstated entry is reported as an advisory
+rather than turning CI red for a parallel clean-up.
 
 Measured detail that matters for the allow-list: the hazard is NOT restricted to
 the indexed column (``ON t(b) WHERE a='x'`` mis-serves), and the safe spellings
