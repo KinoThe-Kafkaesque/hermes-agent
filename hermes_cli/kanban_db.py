@@ -4207,59 +4207,6 @@ def task_age(task: Task) -> dict:
     }
 
 
-# --- Retention + garbage collection ---
-
-def _retention_seconds(older_than_seconds: int) -> int:
-    """Normalise a gc retention window, rejecting negatives.
-
-    Shared by both gc sweeps: a negative window puts the cutoff in the future,
-    so "older than cutoff" would match every row / file instead of none —
-    refuse before any sweep runs.
-    """
-    older_than_seconds = int(older_than_seconds)
-    if older_than_seconds < 0:
-        raise ValueError(
-            f"older_than_seconds must be >= 0, got {older_than_seconds!r}: "
-            "a negative retention selects everything."
-        )
-    return older_than_seconds
-
-
-def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
-
-    ``older_than_seconds=0`` means everything older than now; the CLI maps
-    ``--event-retention-days 0`` to "disabled" before calling this.
-    """
-    cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
-    with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
-        )
-    return int(cur.rowcount or 0)
-
-
-def gc_worker_logs(*, older_than_seconds: int = 30 * 24 * 3600, board: Optional[str] = None) -> int:
-    """Delete worker log files older than the cutoff on one board; returns the count.
-
-    ``older_than_seconds=0`` means everything older than now; the CLI maps
-    ``--log-retention-days 0`` to "disabled" before calling this.
-    """
-    older_than_seconds = _retention_seconds(older_than_seconds)
-    log_dir = worker_logs_dir(board=board)
-    if not log_dir.exists():
-        return 0
-    cutoff = time.time() - older_than_seconds
-    removed = 0
-    for p in log_dir.iterdir():
-        with contextlib.suppress(OSError):
-            if p.is_file() and p.stat().st_mtime < cutoff:
-                p.unlink()
-                removed += 1
-    return removed
-
-
 # --- Worker log accessor ---
 
 def worker_log_path(task_id: str, *, board: Optional[str] = None) -> Path:
@@ -4440,4 +4387,13 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+)
+# Re-exported so callers/tests that reach these through the facade keep working;
+# the bodies live in the topical sibling (kanban_db_gc).
+from hermes_cli.kanban_db_gc import (  # noqa: E402
+    _retention_seconds,
+    _run_retention_floor_seconds,
+    gc_events,
+    gc_runs,
+    gc_worker_logs,
 )

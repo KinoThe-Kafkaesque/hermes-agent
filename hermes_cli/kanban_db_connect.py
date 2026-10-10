@@ -946,6 +946,27 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # Serves the shared provider-demotion tally read
+    # (``outcome = ? AND ended_at >= ?``), which runs on EVERY spawn: without it
+    # that read is a full ``SCAN task_runs``. Created HERE, not in SCHEMA_SQL,
+    # because a drifted legacy ``task_runs`` is rebuilt above (DROP/RENAME) and a
+    # ``CREATE INDEX`` over ``outcome``/``ended_at`` in the schema script would
+    # abort init on such a board before the rebuild runs ("no such column").
+    #
+    # Composite, not the partial ``(ended_at) WHERE outcome='rate_limited'``:
+    # measured 2026-10-09, a partial index whose WHERE holds that literal makes a
+    # REUSED parameterized statement return WRONG rows for every other bound
+    # ``outcome`` value once the index appears under a live connection (10/10 on
+    # sqlite 3.53.1 and 3.37.2; fresh connections and PRAGMA integrity_check are
+    # correct, and ``cached_statements=0`` removes it — the vector is the reused
+    # prepared statement). The composite form is exact and gives the same
+    # ``SEARCH ... (outcome=? AND ended_at>?)`` plan.
+    if _table_exists(conn, "task_runs"):
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_outcome_ended "
+            "ON task_runs(outcome, ended_at)"
+        )
+
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
     """One-shot backfill: tasks 'running' before runs existed carried
@@ -1039,6 +1060,7 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
+            "CREATE INDEX idx_runs_outcome_ended ON task_runs(outcome, ended_at)",
         ),
     ),
     "kanban_notify_subs": (
