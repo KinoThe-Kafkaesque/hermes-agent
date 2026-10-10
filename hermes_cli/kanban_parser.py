@@ -448,7 +448,12 @@ _SPECS = [
              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
         _arg("--log-retention-days", type=_nonnegative_int, default=30,
              help="Delete worker log files older than N days (default: 30; 0 disables)"),
-    ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
+        _arg("--run-retention-days", type=_nonnegative_int, default=0,
+             help="Delete task_runs rows older than N days for terminal tasks "
+                  "(default: 0 = disabled; run rows carry handoff summaries and the "
+                  "provider-demotion evidence, so keeping them is the conservative default). "
+                  "Windows shorter than the shared tally read window (1 day) are floored to it."),
+    ], help="Garbage-collect archived-task workspaces, old events, old logs, and old runs"),
     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
          help="Check kanban.db integrity and auto-repair index-only corruption",
          description=(

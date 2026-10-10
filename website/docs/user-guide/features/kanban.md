@@ -998,8 +998,9 @@ hermes kanban notify-unsubscribe <id>
 hermes kanban context <id>                             # what a worker sees
 hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-column idea
         [--author NAME] [--json]                       #   into a full spec and promote to todo
-hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
+hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs + old runs
         [--log-retention-days N]                       #   (negative N is rejected; 0 disables that sweep)
+        [--run-retention-days N]                       #   run rows default to 0 = disabled
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
