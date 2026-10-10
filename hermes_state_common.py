@@ -282,6 +282,52 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 
 SCHEMA_VERSION = 31
 
+# The composite replacement for every pre-existing partial index whose ``WHERE`` equated a
+# column to a scalar literal. ``_heal_dangerous_partial_indexes`` (hermes_state_schema) drops
+# the dangerous spelling when it finds it and creates the composite; ``SCHEMA_SQL`` /
+# ``DEFERRED_INDEX_SQL`` ship the composite directly for fresh databases. See
+# ``scripts/ci/check_partial_index_where.py`` for the measured hazard.
+_COMPOSITE_INDEX_REPLACEMENTS: tuple[tuple[str, str], ...] = (
+    ("idx_messages_assistant_calls_by_session",
+     "CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session"
+     " ON messages(session_id, role, tool_calls)"),
+    ("idx_messages_display_page",
+     "CREATE INDEX IF NOT EXISTS idx_messages_display_page"
+     " ON messages(session_id, display_order, active DESC, id DESC)"),
+    ("idx_messages_display_backfill",
+     "CREATE INDEX IF NOT EXISTS idx_messages_display_backfill"
+     " ON messages(session_id, display_order, display_identity)"),
+    ("idx_messages_display_identity",
+     "CREATE INDEX IF NOT EXISTS idx_messages_display_identity"
+     " ON messages(session_id, display_identity, display_order)"),
+    ("idx_messages_session_uid",
+     "CREATE INDEX IF NOT EXISTS idx_messages_session_uid"
+     " ON messages(session_id, message_uid, active)"),
+)
+
+
+def _partial_where_has_literal_equality(index_sql: str) -> bool:
+    """True when *index_sql* is a partial ``CREATE INDEX`` whose ``WHERE`` compares a column
+    to a scalar literal with ``=`` (or a single-literal ``IN``) — the spelling that makes a
+    reused parameterized statement return wrong rows.
+
+    The shape is parsed from the stored DDL rather than matched against a quoted literal, so
+    this recognizes any equivalent spelling. The safe operators (``IS``, ``!=``, ``<>``,
+    ``>=``, ``<=``, ``LIKE``, ``GLOB``, a function call, a two-literal ``IN``) do not match.
+    """
+    import re
+
+    match = re.search(r"\bWHERE\b(.*)$", index_sql or "", re.IGNORECASE | re.DOTALL)
+    if not match:
+        return False
+    where = match.group(1)
+    if re.search(r"(?<![!<>=])\b[A-Za-z_][\w.]*\s*=\s*"
+                 r"('(?:[^']|'')*'|-?\d+(?:\.\d+)?)(?![.\d])", where):
+        return True
+    return bool(re.search(r"\b[A-Za-z_][\w.]*\s+IN\s*\(\s*"
+                          r"('(?:[^']|'')*'|-?\d+(?:\.\d+)?)\s*\)", where, re.IGNORECASE))
+
+
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
 # freelist_count / PRAGMA page_count``). Below it a full rewrite costs more I/O than it returns — pruning a
@@ -615,14 +661,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
--- Partial index for the Insights assistant tool-call scan
+-- Serving index for the Insights assistant tool-call scan
 -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
 -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of
 -- rows on a large state.db. role and tool_calls are base columns, so this can
 -- live in SCHEMA_SQL rather than DEFERRED_INDEX_SQL.
+--
+-- COMPOSITE, not the retired partial ``(session_id) WHERE role='assistant' AND
+-- tool_calls IS NOT NULL``: a partial index whose WHERE equates a column to a
+-- scalar literal makes a REUSED parameterized statement return WRONG rows once
+-- the index appears under a live connection (measured; see
+-- scripts/ci/check_partial_index_where.py). The composite is exact (identical
+-- rows, same plan) and is immune — here it is also strictly faster (covering).
 CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
-    ON messages(session_id)
-    WHERE role = 'assistant' AND tool_calls IS NOT NULL;
+    ON messages(session_id, role, tool_calls);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
@@ -632,18 +684,24 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 """
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
+#
+# COMPOSITE, not partial-with-a-literal: a partial index whose WHERE equates a
+# column to a scalar literal makes a REUSED parameterized statement return WRONG
+# rows once the index appears under a live connection (measured on this fleet's
+# SQLite; the vector is the cached statement, see
+# scripts/ci/check_partial_index_where.py). The three display indexes below and
+# idx_messages_session_uid used to carry such a WHERE (``active = 1`` /
+# ``active = 1 OR compacted = 1``); the composite forms are exact — identical
+# rows, same plan for every production consumer — and immune.
 DEFERRED_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_display_page
-    ON messages(session_id, display_order, active DESC, id DESC)
-    WHERE active = 1 OR compacted = 1;
+    ON messages(session_id, display_order, active DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_display_backfill
-    ON messages(session_id) WHERE (display_order IS NULL OR display_identity IS NULL)
-    AND (active = 1 OR compacted = 1);
+    ON messages(session_id, display_order, display_identity);
 CREATE INDEX IF NOT EXISTS idx_messages_display_identity
-    ON messages(session_id, display_identity, display_order)
-    WHERE display_identity IS NOT NULL AND (active = 1 OR compacted = 1);
+    ON messages(session_id, display_identity, display_order);
 DROP TRIGGER IF EXISTS messages_message_uid_insert;
 CREATE TRIGGER IF NOT EXISTS messages_message_uid_insert
 AFTER INSERT ON messages WHEN new.message_uid IS NULL
@@ -722,8 +780,9 @@ END;
 CREATE INDEX IF NOT EXISTS idx_messages_active_null
     ON messages(active) WHERE active IS NULL;
 -- Logical-identity recovery (agent.transcript_repair._active_logical_message_row) runs inside the write lock.
+-- COMPOSITE, not the retired partial ``WHERE active = 1`` (same statement-cache hazard as the display indexes above).
 CREATE INDEX IF NOT EXISTS idx_messages_session_uid
-    ON messages(session_id, message_uid) WHERE active = 1;
+    ON messages(session_id, message_uid, active);
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_gateway_peer

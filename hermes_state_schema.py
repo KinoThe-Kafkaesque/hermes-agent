@@ -24,7 +24,9 @@ from hermes_state_common import (
     DEFERRED_INDEX_SQL, FTS_CJK_STALE_KEY, FTS_REBUILD_DEFERRAL_KEY, FTS_STALE_KEY, FTS_SQL,
     FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS, FTS_TRIGRAM_SQL, LEGACY_FTS_SQL,
     LEGACY_FTS_TRIGRAM_SQL, SCHEMA_SQL,
-    SCHEMA_VERSION, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS, _ephemeral_child_sql, _sql_json_extract, fts_rebuild_admission,
+    SCHEMA_VERSION, _COMPOSITE_INDEX_REPLACEMENTS, _FTS_CJK_TRIGGERS, _FTS_TRIGGERS,
+    _ephemeral_child_sql, _partial_where_has_literal_equality, _sql_json_extract,
+    fts_rebuild_admission,
 )
 from hermes_state_fts import _drop_orphan_fts_shadow_tables
 from hermes_state_holders import _read_proc_argv
@@ -861,6 +863,39 @@ class SessionSchemaMixin:
             "FROM gateway_routing_legacy_pk ORDER BY updated_at ASC",
         )
 
+    @staticmethod
+    def _heal_dangerous_partial_indexes(cursor: sqlite3.Cursor) -> None:
+        """Replace a pre-existing partial index whose ``WHERE`` equates a column to a scalar
+        literal with its composite form. Idempotent; safe to run on every open.
+
+        Why a heal rather than only a schema edit: ``CREATE INDEX IF NOT EXISTS`` is a
+        no-op when the name already exists, so editing ``SCHEMA_SQL``/``DEFERRED_INDEX_SQL``
+        alone leaves every already-open state.db carrying the dangerous index. And the
+        danger is not hypothetical — a partial index whose ``WHERE`` holds a scalar
+        literal makes a REUSED parameterized statement return WRONG rows once the index
+        appears under a live connection (measured; the vector is the connection's cached
+        statement — see ``scripts/ci/check_partial_index_where.py``). The composite form
+        is exact (identical rows, same plan for every production consumer) and immune.
+
+        The dangerous shape is DETECTED from the stored ``sqlite_master.sql`` rather than
+        matched against a quoted copy of the retired spelling, so this heals any equivalent
+        spelling and cannot itself become a stale literal. Indexes whose WHERE is not a
+        scalar-literal equality (``idx_messages_active_null``, ``idx_messages_platform_msg_id``)
+        are left alone.
+        """
+        live = dict(cursor.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name IN (%s)"
+            % ",".join("?" * len(_COMPOSITE_INDEX_REPLACEMENTS)),
+            [name for name, _ in _COMPOSITE_INDEX_REPLACEMENTS],
+        ).fetchall())
+        for name, composite_ddl in _COMPOSITE_INDEX_REPLACEMENTS:
+            stored = live.get(name)
+            if stored is None or not _partial_where_has_literal_equality(stored):
+                continue
+            cursor.execute(f'DROP INDEX IF EXISTS "{name}"')
+            cursor.execute(composite_ddl)
+            logger.info("replaced dangerous partial index %s with its composite form", name)
+
     def _heal_session_model_usage_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``session_model_usage`` when its PRIMARY KEY lacks ``task``: installs already at
         v22+ when ``task`` landed carry the 5-column PK, the reconciler ADDs ``task`` but
@@ -939,6 +974,11 @@ class SessionSchemaMixin:
 
         # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
         self._reconcile_columns(cursor)
+        # Replace any pre-existing partial index whose WHERE equates a column to a scalar
+        # literal with its composite form. Must run BEFORE the DEFERRED_INDEX_SQL below:
+        # that script's ``CREATE INDEX IF NOT EXISTS`` is a no-op when the name exists, so
+        # the heal is the only thing that retires the dangerous spelling on a live DB.
+        self._heal_dangerous_partial_indexes(cursor)
         self._heal_gateway_routing_pk(cursor)
         # Rebuild session_model_usage if its PRIMARY KEY lacks the ``task`` column (5-column PK on installs
         # already at v22+ when the column landed — the version-gated rebuild is unreachable there, #73823).
