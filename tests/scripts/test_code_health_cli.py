@@ -7,6 +7,8 @@ in a clone, against tiny trees that keep every check fast.
 
 from __future__ import annotations
 
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -23,6 +25,8 @@ from scripts.code_health.config import ENFORCEMENT
 
 REPO = Path(__file__).resolve().parents[2]
 # One entry per `_GUARDS` entry in scripts/check: these are the scripts the runner executes.
+# `test_guard_scripts_parity_with_scripts_check` parses scripts/check and enforces that claim, so
+# a newly registered guard reddens here by name instead of surfacing as an opaque `Errno 2`.
 _GUARD_SCRIPTS = (
     "scripts/check-windows-footguns.py", "scripts/check_bash_shebangs.py",
     "scripts/check_no_tmp_literals.py", "scripts/check_config_yaml_writers.py",
@@ -43,6 +47,85 @@ _ENV_COPY = "import os\n\n\ndef child_env():\n    env = os.environ.copy()\n    r
 # A violation of a rule that always blocks (PS-P05 is warning-only until replayed).
 _SWALLOW = "def swallow():\n    try:\n        pass\n    except Exception:\n        pass\n"
 _SWITCH = "scripts/code_health/config.py"
+
+
+def _executed_guard_scripts() -> frozenset[str]:
+    """The script each ``scripts/check`` ``_GUARDS`` entry runs, read off the module itself.
+
+    Imported, not text-scanned: the claim under test is about the object the runner iterates,
+    so deriving from the module makes a renamed or reshaped ``_GUARDS`` a named failure here
+    instead of a silently empty comparison. ``argv[0]`` is the script (``footguns`` appends
+    ``--all``); ``_CHECKS`` also carries the two non-guard checks, so ``_GUARDS`` is the key.
+    """
+    loader = importlib.machinery.SourceFileLoader(
+        "_hermes_scripts_check", str(REPO / "scripts/check"))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    # Registered for the duration: the module's dataclass resolves its annotations through
+    # `sys.modules[cls.__module__]`, which is None for an unregistered module.
+    sys.modules[loader.name] = module
+    try:
+        loader.exec_module(module)
+    finally:
+        sys.modules.pop(loader.name, None)
+    return frozenset(argv[0] for argv in module._GUARDS.values())
+
+
+def test_guard_scripts_parity_with_scripts_check():
+    """``_GUARD_SCRIPTS`` is exactly the set of scripts ``scripts/check``'s ``_GUARDS`` executes.
+
+    The fixture hand-copies this list under a claim of parity that nothing enforced, so
+    ``t_fc247363`` registered a guard and never added it here; the fixture's own runner then
+    died with an opaque ``can't open file ... [Errno 2]`` inside an unrelated assertion.
+    """
+    executed = _executed_guard_scripts()
+    missing = sorted(executed - set(_GUARD_SCRIPTS))
+    assert not missing, (
+        f"{missing} are registered in scripts/check's _GUARDS but absent from _GUARD_SCRIPTS: "
+        "add them (a guard the fixture does not carry fails as `can't open file ... [Errno 2]`)"
+    )
+    stale = sorted(set(_GUARD_SCRIPTS) - executed)
+    assert not stale, (
+        f"_GUARD_SCRIPTS lists {stale}, which scripts/check's _GUARDS does not execute: "
+        "register them there or drop them here"
+    )
+
+
+def test_support_tier_is_not_demanded_to_be_an_executed_guard():
+    """``_SUPPORT``'s other entries are read by guards, never run as one.
+
+    The parity arm above keys on ``_GUARD_SCRIPTS`` alone, so it can never demand that the
+    policy file, the measured module, or the partial-index facade's topical sibling be a
+    ``_GUARDS`` entry. This pins the converse: the support tier is real (each entry exists) and
+    disjoint from the executed set, so a support file that BECOMES an executed guard must be
+    promoted into ``_GUARD_SCRIPTS`` — where the parity arm can see it — rather than left in the
+    tier that arm cannot.
+    """
+    support_only = tuple(rel for rel in _SUPPORT if rel not in _GUARD_SCRIPTS)
+    assert support_only, "the support tier is empty: _SUPPORT is just _GUARD_SCRIPTS again"
+    for rel in support_only:
+        assert (REPO / rel).is_file(), f"support entry {rel} does not exist"
+    leaked = sorted(set(support_only) & _executed_guard_scripts())
+    assert not leaked, (
+        f"{leaked} are read as support but executed as guards: move them into _GUARD_SCRIPTS "
+        "so the parity arm covers them"
+    )
+
+
+def test_fixture_tree_guard_names_a_missing_executed_guard(tmp_path, monkeypatch):
+    """The fixture builder fails BY NAME when an executed guard was not copied in.
+
+    A direct pin on the widened failure surface: dropping one guard from the copied set must
+    raise an assertion naming the script, not let the fixture's own scripts/check report the
+    opaque ``Errno 2`` from deep inside whichever test happens to run first.
+    """
+    dropped = "scripts/ci/check_partial_index_where.py"
+    monkeypatch.setattr(sys.modules[__name__], "_SUPPORT",
+                        tuple(rel for rel in _SUPPORT if rel != dropped))
+    repo = _init(tmp_path / "repo")
+    with pytest.raises(AssertionError, match=f"missing executed guard.*{re.escape(dropped)}"):
+        _add_engine(repo)
 
 
 def _env() -> dict[str, str]:
@@ -97,6 +180,13 @@ def _add_engine(repo: Path, checker: bool = True) -> list[str]:
     for rel in _SUPPORT:
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / rel, repo / rel)
+    # Widened failure surface: a guard the copied set forgot is a NAMED error here, not the
+    # opaque `can't open file ... [Errno 2]` the fixture's own scripts/check would emit later.
+    absent = sorted(rel for rel in _GUARD_SCRIPTS if not (repo / rel).is_file())
+    assert not absent, (
+        f"the fixture tree is missing executed guard(s) {absent}: they are in scripts/check's "
+        "_GUARDS but not in the copied set (_SUPPORT)"
+    )
     _write(repo, {"tests/README.md": "os-marker-fakes scans tests/\n"})
     if checker:
         shutil.copy2(REPO / "scripts/check", repo / "scripts/check")
