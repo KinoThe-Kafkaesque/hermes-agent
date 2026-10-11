@@ -7,6 +7,7 @@ in a clone, against tiny trees that keep every check fast.
 
 from __future__ import annotations
 
+import ast
 import importlib.machinery
 import importlib.util
 import json
@@ -37,6 +38,9 @@ _GUARD_SCRIPTS = (
 # Read by the guard scripts rather than executed as one: a policy file, a module the
 # agents-md guard measures, and the topical sibling the partial-index facade imports (its arm 2
 # and the WHERE/DDL matchers both arms read), which would otherwise fail to import in the fixture.
+# `test_support_tier_covers_every_staged_dependency` DERIVES this tier from what the staged
+# scripts actually read, and `test_fixture_tree_guard_names_a_missing_support_file` proves the
+# failure it prevents is a named one — so a new support file cannot be forgotten here.
 _SUPPORT = (
     "scripts/ci/profile_scope_patterns.json", "agent/subdirectory_hints.py",
     "scripts/ci/check_partial_index_where_markers.py", *_GUARD_SCRIPTS,
@@ -70,6 +74,33 @@ def _executed_guard_scripts() -> frozenset[str]:
     finally:
         sys.modules.pop(loader.name, None)
     return frozenset(argv[0] for argv in module._GUARDS.values())
+
+
+def _engine_scripts() -> tuple[str, ...]:
+    """The runner and every module of its package: the fixture stages the engine wholesale."""
+    package = REPO / "scripts" / "code_health"
+    return ("scripts/check", *sorted(
+        str(p.relative_to(REPO)) for p in package.rglob("*.py") if "__pycache__" not in p.parts))
+
+
+# The interpreter's own wording for "something the fixture did not stage". A guard that dies
+# this way is the FIXTURE being incomplete, not the guard finding a problem, so the two are told
+# apart by the error text rather than by the exit code (a guard exits non-zero for findings too).
+_MISSING_DEPENDENCY = (
+    re.compile(r"FileNotFoundError: \[Errno 2\] No such file or directory: '(?P<path>[^']+)'"),
+    re.compile(r"ModuleNotFoundError: No module named '(?P<name>[^']+)'"),
+    re.compile(r"ImportError: cannot import name '(?P<name>[^']+)' from '(?P<module>[^']+)'"),
+)
+
+
+def _missing_dependency(proc: subprocess.CompletedProcess) -> str | None:
+    """The path or module a staged script could not reach, read off its own error output."""
+    output = proc.stdout + proc.stderr
+    for pattern in _MISSING_DEPENDENCY:
+        match = pattern.search(output)
+        if match:
+            return match.groupdict().get("path") or match.groupdict().get("name")
+    return None
 
 
 def test_guard_scripts_parity_with_scripts_check():
@@ -113,6 +144,68 @@ def test_support_tier_is_not_demanded_to_be_an_executed_guard():
     )
 
 
+def _imported_siblings(source: str) -> frozenset[str]:
+    """Repo modules a staged script imports, resolved from its import statements.
+
+    ``from scripts.ci import markers`` may name either a module or an attribute, so a candidate
+    path counts when it exists on disk: an attribute import of a real sibling module is exactly
+    the case the fixture has to stage. Stdlib and third-party names resolve to nothing in this
+    repo, so they fall out without a hardcoded allowlist.
+    """
+    found: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            base = node.module.replace(".", "/")
+            candidates = [f"{base}.py", f"{base}/__init__.py",
+                          *(f"{base}/{alias.name}.py" for alias in node.names)]
+        elif isinstance(node, ast.Import):
+            candidates = [f"{alias.name.replace('.', '/')}.py" for alias in node.names]
+        else:
+            continue
+        found.update(rel for rel in candidates if (REPO / rel).is_file())
+    return frozenset(found)
+
+
+def _staged_sibling_imports() -> frozenset[str]:
+    """Sibling modules the staged scripts import that the fixture does not stage itself.
+
+    Derived, never hand-listed: ``t_fc247363`` added the partial-index sibling and the fixture
+    kept failing as an opaque ``ImportError`` because no arm derived this set. The engine
+    (``scripts/check`` + ``scripts/code_health/*``) is staged wholesale by ``_add_engine``, so
+    its own internal imports are already satisfied and are excluded here.
+    """
+    staged = {*_GUARD_SCRIPTS, *_engine_scripts()}
+    imported: set[str] = set()
+    for rel in sorted(staged):
+        imported |= _imported_siblings((REPO / rel).read_text(encoding="utf-8-sig"))
+    return frozenset(imported - staged)
+
+
+def test_support_tier_covers_every_staged_sibling_import():
+    """Every sibling module a staged script imports is in ``_SUPPORT`` — derived, not hand-listed.
+
+    The support tier's hand-list is the second half of the drift this lane has now paid for three
+    times: a new sibling module imported by a guard is absent from the fixture and dies as an
+    ``ImportError`` inside whichever hook test runs first, not as a named failure. This derives
+    the required set from the staged scripts' own import statements, so adding an import without
+    staging it reddens here by name.
+
+    Only the missing direction is asserted here. The reverse (every ``_SUPPORT`` entry is
+    required) is NOT an import question — two of the three support-only entries are reached by a
+    path literal, not an import, so a set-equality arm would demand ``AGENTS.md``, ``utils.py``
+    and ``package.json`` too. That direction is pinned behaviourally by
+    ``test_fixture_tree_guard_names_a_missing_support_file``, which proves each entry is
+    load-bearing by dropping it and requiring a named failure.
+    """
+    required = _staged_sibling_imports()
+    assert required, "derived no sibling imports at all: the derivation is broken, not the tier"
+    missing = sorted(required - set(_SUPPORT))
+    assert not missing, (
+        f"{missing} are imported by staged scripts but absent from _SUPPORT: add them (a sibling "
+        "the fixture does not carry fails as `ImportError: cannot import name ...`)"
+    )
+
+
 def test_fixture_tree_guard_names_a_missing_executed_guard(tmp_path, monkeypatch):
     """The fixture builder fails BY NAME when an executed guard was not copied in.
 
@@ -126,6 +219,66 @@ def test_fixture_tree_guard_names_a_missing_executed_guard(tmp_path, monkeypatch
     repo = _init(tmp_path / "repo")
     with pytest.raises(AssertionError, match=f"missing executed guard.*{re.escape(dropped)}"):
         _add_engine(repo)
+
+
+def test_fixture_tree_guard_names_a_missing_support_file(tmp_path):
+    """Each support entry is load-bearing, and losing it reddens ``scripts/check`` BY NAME.
+
+    The support tier's half of the same surface, and the reverse of the import arm above: every
+    entry is dropped from the staged set in turn and the fixture's own runner is executed. The
+    run must fail, and the failure must name the file it could not reach — an unnamed traceback
+    is the opaque ``Errno 2`` shape this lane keeps paying for. The complete tier must run clean
+    first, so the arm cannot pass by everything being red.
+
+    The tier is passed to the staging helper explicitly rather than read from ``_SUPPORT`` at
+    call time: the dropped-variant loop mutates the module global, so a control that re-read it
+    would stage the MUTATED tier and red on the control too (measured — the first version of this
+    arm did exactly that under a dropped entry).
+    """
+    complete_tier = _SUPPORT
+    support_only = tuple(rel for rel in complete_tier if rel not in _GUARD_SCRIPTS)
+    assert support_only, "the support tier is empty: nothing to drop"
+
+    def staged_repo(name: str, tier: tuple[str, ...]) -> Path:
+        """An engine repo whose first commit carries the engine plus ``tier``, verbatim."""
+        repo = _init(tmp_path / name)
+        _write(repo, {"pkg/a.py": "def a():\n    return 1\n"})
+        for rel in tier:
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO / rel, repo / rel)
+        _write(repo, {"tests/README.md": "os-marker-fakes scans tests/\n"})
+        shutil.copy2(REPO / "scripts/check", repo / "scripts/check")
+        shutil.copytree(REPO / "scripts/code_health", repo / "scripts/code_health",
+                        ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
+        trees = [tree for tree in ("agent", "scripts", "tests") if (repo / tree).exists()]
+        _git(repo, "add", "--all", "--", ".gitignore", "pyproject.toml", "pkg", *trees)
+        _git(repo, "commit", "-q", "-m", "base")
+        return repo
+
+    def staged_run(repo: Path) -> subprocess.CompletedProcess:
+        _write(repo, {"pkg/c.py": "def c():\n    return 3\n"})
+        _git(repo, "add", "--", "pkg/c.py")
+        return _check(repo, "--staged", "--base", "HEAD")
+
+    complete = staged_run(staged_repo("full", complete_tier))
+    absent = _missing_dependency(complete)
+    assert complete.returncode == 0 and absent is None, (
+        f"the declared support tier does not run clean: {absent!r} is missing "
+        f"({complete.stdout + complete.stderr})"
+    )
+
+    for rel in support_only:
+        proc = staged_run(staged_repo(rel.replace("/", "_").replace(".", "-"),
+                                      tuple(r for r in complete_tier if r != rel)))
+        assert proc.returncode != 0, f"dropping {rel} left the fixture green: {proc.stdout}"
+        missing = _missing_dependency(proc)
+        assert missing is not None, (
+            f"dropping {rel} failed without naming the file it could not reach (the opaque "
+            f"failure shape this arm exists to prevent): {proc.stdout + proc.stderr}"
+        )
+        assert Path(missing).name == Path(rel).name or Path(rel).stem in missing, (
+            f"dropping {rel} named {missing!r} instead"
+        )
 
 
 def _env() -> dict[str, str]:
