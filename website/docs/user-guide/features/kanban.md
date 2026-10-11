@@ -1434,6 +1434,23 @@ the host's own SQLite so the premise cannot silently rot. The safe spellings of
 the same intent — `IS NOT NULL`, `!=`, `>=`, `LIKE`, `GLOB`, a function call, or
 `IN` with two-or-more literals — measured unaffected.
 
+The guard has a **second arm that makes the `partial-index: ok` opt-out
+falsifiable**. Where a partial predicate is load-bearing and the column is never
+bound with `=`, a kept-partial index may carry the sanctioned
+`partial-index: ok — <why>` marker — but the marker's honesty claim (that the
+column is never bound with `=` in a predicate by production) was previously
+enforced by nothing: the marker could stay present while a new writer bound the
+column with `=`, making it silently false. The arm derives the marked columns and
+tables **from the marked DDL** (so a new marker widens what is enforced
+automatically) and refuses any tracked production string constant that binds one
+of those columns with a placeholder (`?`, `?1`, `:name`, `@name`, `$name`) in a
+**predicate** position on the marked table. A `SET` target is out of scope —
+measured, `UPDATE t SET col = ?` does not reproduce the anomaly. The marker's
+own claim, and this arm, live in
+`scripts/ci/check_partial_index_where_markers.py` (the guard's `main` stayed
+under the repo's cyclomatic-complexity cap by moving the arm and the shared
+WHERE/DDL matchers into that topical sibling).
+
 ### Forward compatibility
 
 Two nullable columns on `tasks` are reserved for v2 workflow routing: `workflow_template_id` (which template this task belongs to) and `current_step_key` (which step in that template is active). The v1 kernel ignores them for routing but lets clients write them, so a v2 release can add the routing machinery without another schema migration.
