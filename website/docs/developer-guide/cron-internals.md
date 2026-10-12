@@ -184,6 +184,21 @@ never writes over the new owner. `Interrupted by shutdown before terminal
 completion.` is therefore recorded only when a real transport cancel (gateway
 drain) stops a run that still holds its claim.
 
+**Live-owner reclaim (the other consumer of that heartbeat).** `recover_interrupted_executions`
+also releases claims whose owner process is still alive, for the deadlocked-worker class
+(`futex_wait` behind a route/proxy flip). The bound is derived per JOB, never from a bare
+wall-clock constant: `max(3 × HERMES_CRON_TIMEOUT, script timeout, 2 × the job's own schedule
+period, 2 × the p95 wall-clock duration of its recent terminal attempts)`. Including the job's
+cadence is what keeps the bound strictly above one full period, so a healthy run that legitimately
+overruns its own interval is not reclaimed by age — the shape that discarded eight 122–125-minute
+`bot-manager-cycle` runs when a fixed 7200 s floor equalled its `every 120m` period exactly. And
+because claim age cannot distinguish "wedged" from "still working", a live owner whose `fire_claim`
+heartbeat is still fresh is **never** reclaimed, whatever its age; a missing or unreadable
+heartbeat is not proof of death and falls through to the bound. A reclaim that does fire is
+recorded with its own reason (`_OWNER_WEDGED_REASON`), whose phrases classify as the distinct
+`stale_live_claim` error class rather than the crash-class `unknown` — the loss has to be visible.
+The reclaimed worker PROCESS is still not terminated.
+
 ### Gateway Integration
 
 In gateway mode, the cron **trigger** (the part that decides *when* a due job

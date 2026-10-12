@@ -998,8 +998,9 @@ hermes kanban notify-unsubscribe <id>
 hermes kanban context <id>                             # what a worker sees
 hermes kanban specify [<id> | --all] [--tenant T]      # flesh out a triage-column idea
         [--author NAME] [--json]                       #   into a full spec and promote to todo
-hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs
+hermes kanban gc [--event-retention-days N]            # workspaces + old events + old logs + old runs
         [--log-retention-days N]                       #   (negative N is rejected; 0 disables that sweep)
+        [--run-retention-days N]                       #   run rows default to 0 = disabled
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
@@ -1392,6 +1393,63 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 **Synthetic runs for never-claimed completions.** Completing or blocking a task that was never claimed (e.g. a human closes a `ready` task from the dashboard with a summary, or a CLI user runs `hermes kanban complete <ready-task> --summary X`) would otherwise drop the handoff. Instead the kernel inserts a zero-duration run row (`started_at == ended_at`) carrying the summary / metadata / reason so attempt history stays complete. The `completed` / `blocked` event's `run_id` points at that row.
 
 **Live drawer refresh.** When the dashboard's WebSocket event stream reports new events for the task the user is currently viewing, the drawer reloads itself (via a per-task event counter threaded into its `useEffect` dependency list). Closing and reopening is no longer required to see a run's new row or updated outcome.
+
+### Partial indexes on `task_runs` are a hazard — use a composite index
+
+The board's `task_runs` reads are parameterized and the connection's statement
+cache is warm, so **do not add a partial index whose `WHERE` compares a column to
+a literal** — `CREATE INDEX … ON task_runs(ended_at) WHERE outcome='rate_limited'`
+is the shape to avoid. Measured 2026-10-09/10 on this fleet's SQLite builds
+(3.53.1, 3.47.1, 3.37.2 across Python 3.10–3.14): such an index makes a **reused**
+parameterized statement return **wrong rows** for a different bound value,
+silently.
+
+The sequence that reproduces it, using the dispatcher's own demotion-tally read:
+
+```sql
+-- on a cached connection:
+SELECT … FROM task_runs WHERE outcome = ? AND ended_at IS NOT NULL AND ended_at >= ? …
+-- bound to 'rate_limited'          -> 200 rows
+CREATE INDEX ix ON task_runs(ended_at) WHERE outcome='rate_limited';
+-- same statement, same bound value -> 200 rows
+-- same statement, 'completed'      -> 0 rows   (200 is correct)
+```
+
+The trigger is the *combination*: the statement was already cached when the
+partial index appeared (a migration on a live board, a sibling connection, or an
+`ANALYZE`), and the newly bound value differs from the index's literal. A fresh
+connection is always correct, `PRAGMA integrity_check` reads `ok`, and
+`cached_statements=0` removes it — which is why it produces wrong results rather
+than an error.
+
+**Use the composite form instead.** `CREATE INDEX … ON task_runs(outcome,
+ended_at)` is exact, is immune to statement-cache reuse, and yields the same
+`SEARCH task_runs USING INDEX … (outcome=? AND ended_at>?)` plan. That is why the
+board ships `idx_runs_outcome_ended` as a composite (`hermes_cli/kanban_db_connect.py`).
+
+`scripts/ci/check_partial_index_where.py` refuses NEW partial indexes whose
+`WHERE` compares a column to a scalar literal (or a single-literal `IN`), and
+`tests/hermes_cli/test_partial_index_where_anomaly.py` reproduces the anomaly on
+the host's own SQLite so the premise cannot silently rot. The safe spellings of
+the same intent — `IS NOT NULL`, `!=`, `>=`, `LIKE`, `GLOB`, a function call, or
+`IN` with two-or-more literals — measured unaffected.
+
+The guard has a **second arm that makes the `partial-index: ok` opt-out
+falsifiable**. Where a partial predicate is load-bearing and the column is never
+bound with `=`, a kept-partial index may carry the sanctioned
+`partial-index: ok — <why>` marker — but the marker's honesty claim (that the
+column is never bound with `=` in a predicate by production) was previously
+enforced by nothing: the marker could stay present while a new writer bound the
+column with `=`, making it silently false. The arm derives the marked columns and
+tables **from the marked DDL** (so a new marker widens what is enforced
+automatically) and refuses any tracked production string constant that binds one
+of those columns with a placeholder (`?`, `?1`, `:name`, `@name`, `$name`) in a
+**predicate** position on the marked table. A `SET` target is out of scope —
+measured, `UPDATE t SET col = ?` does not reproduce the anomaly. The marker's
+own claim, and this arm, live in
+`scripts/ci/check_partial_index_where_markers.py` (the guard's `main` stayed
+under the repo's cyclomatic-complexity cap by moving the arm and the shared
+WHERE/DDL matchers into that topical sibling).
 
 ### Forward compatibility
 

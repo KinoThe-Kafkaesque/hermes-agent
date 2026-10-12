@@ -143,8 +143,13 @@ hermes.status = failed|unknown
 hermes.delivery_outcome = failed|not_configured
 hermes.error_class = auth_failed|rate_limited|timeout|network_error|
                      dispatch_failed|interrupted|empty_response|
-                     invalid_config|unknown
+                     invalid_config|stale_live_claim|unknown
 ```
+
+`stale_live_claim` is a cron execution whose claim was released while its owner process was still
+alive (the reclaim path in `cron/executions.py`). It is deliberately distinct from `unknown`: the
+run had produced work, and the reclaim discarded it, so it needs its own operator action rather
+than reading as a crash.
 
 Recommended operator views:
 

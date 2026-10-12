@@ -21,6 +21,21 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   is never cut off. Attached scripts (pre-run or `no_agent`) are bounded separately by the script
   timeout (`_DEFAULT_SCRIPT_TIMEOUT`, 3600s).
 - Catch-up window = half the period, clamped to 120s–2h; 120s grace for missed one-shots.
+- **The live-owner stale-claim bound is derived from the JOB, never a bare wall-clock constant.**
+  `cron/executions.py::_live_owner_stale_after_seconds(conn, job_id)` takes the max of
+  `3 × HERMES_CRON_TIMEOUT`, the script timeout, **twice the job's own schedule period**
+  (`cron.jobs._schedule_cadence_seconds`, the same reader the catch-up grace uses) and **twice the
+  p95 wall-clock duration of its recent terminal attempts**. The cadence term is why the bound can
+  never land on (or below) a job's own interval: a fixed 7200 s floor equalled `every 120m`'s period
+  exactly, so eight healthy 122–125-minute `bot-manager-cycle` runs were reclaimed mid-flight and
+  their reports discarded (#131247). **A live owner is also never reclaimed while its own
+  `fire_claim` heartbeat is fresh** (`_live_owner_heartbeat_is_fresh`) — claim age cannot distinguish
+  "wedged" from "still working", and the heartbeat can. Absence of a heartbeat is not proof of death:
+  fall through to the bound. The reclaim carries `_OWNER_WEDGED_REASON`, whose phrases map to the
+  `stale_live_claim` error class in BOTH `cron/incidents.py::_classify_failure_type` and
+  `agent/monitoring/cron_health.py::classify_cron_error` — a reclaimed live run must not read as a
+  crash (the documented `hermes.error_class` enum in `website/docs/developer-guide/gateway-monitoring.md`
+  is bound to the classifier by `tests/monitoring/test_cron_health_export.py`).
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that
   finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
@@ -112,7 +127,8 @@ Durable SQLite-backed board letting multiple profiles/workers collaborate. Users
 zero outside a kanban task (footprint ladder rung 3).
 
 - **CLI:** `hermes_cli/kanban.py` facade + 14 `kanban_*.py` siblings (`boards`, `db`, `db_connect`,
-  `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
+  `db_dispatch`, `db_notify`, `db_graph` (task initialization and decomposition), `db_paths` (board
+  path resolution + `isolated_board`), `workspace`, ...). Verbs: `init, create, list (ls), show, assign, link,
   unlink, comment, attach, attachments, attach-rm, complete, request-review, request-changes,
   reopen-review, block, unblock, archive, tail`, plus `watch, stats, runs, log, assignees, heartbeat,
   notify-*, dispatch, daemon, gc`. Argparse alias dispatch must accept both `list` and `ls` (root).
@@ -132,7 +148,11 @@ zero outside a kanban task (footprint ladder rung 3).
 
 Isolation: **board** is the hard boundary — workers get `HERMES_KANBAN_BOARD` pinned in their env and
 cannot see other boards; **tenant** is a soft namespace within a board (workspace-path + memory-key
-isolation, one fleet serving several businesses). After `kanban.failure_limit` consecutive
+isolation, one fleet serving several businesses). Board paths resolve in
+`hermes_cli/kanban_db_paths.py` (the `kanban_db` facade re-exports them); `HERMES_KANBAN_HOME`
+alone cannot isolate a board — the `HERMES_KANBAN_DB` pin outranks it and is injected into every
+worker — so use `kanban_db.isolated_board()`, which sets the home and clears every pin together and
+raises `KanbanBoardPinConflict` when a pin contradicts an explicitly-set home. After `kanban.failure_limit` consecutive
 non-success attempts on a task (default 2) the dispatcher auto-blocks it to stop spin loops; a
 worker exit of `KANBAN_TERMINAL_PROVIDER_EXIT_CODE` (78 — credential revoked, model gone; the
 worker's own `failure_reason` classification via `cli._TERMINAL_PROVIDER_REASONS`) trips it on

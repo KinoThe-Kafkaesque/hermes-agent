@@ -303,11 +303,14 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 
 
 def _cmd_gc(args: argparse.Namespace) -> int:
-    """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
+    """Remove archived tasks' scratch workspaces, old events, old worker logs, old runs."""
     import shutil
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
-    if event_days < 0 or log_days < 0:
+    # Runs default to 0 (disabled): a run row carries the handoff summary/metadata a
+    # card's declaration lives in, so deleting it is an operator decision.
+    run_days = getattr(args, "run_retention_days", 0)
+    if event_days < 0 or log_days < 0 or run_days < 0:
         return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
     scratch_root = kb.workspaces_root()
     removed_ws = 0
@@ -348,8 +351,13 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         with kbc.connect_closing() as conn:
             removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
     removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600) if log_days else 0
+    removed_runs = 0
+    if run_days:
+        with kbc.connect_closing() as conn:
+            removed_runs = kb.gc_runs(conn, older_than_seconds=run_days * 24 * 3600)
     print(f"GC complete: {removed_ws} workspace(s), "
-          f"{removed_events} event row(s), {removed_logs} log file(s) removed")
+          f"{removed_events} event row(s), {removed_logs} log file(s), "
+          f"{removed_runs} run row(s) removed")
     return 0
 
 

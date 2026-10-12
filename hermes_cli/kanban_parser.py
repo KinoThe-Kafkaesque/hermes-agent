@@ -310,6 +310,15 @@ _SPECS = [
         _arg("--body", help="Replace the task body"),
         _arg("--priority", type=int, help="Replace the task priority"),
         _arg("--result", help="Backfilled task result text for a done task"),
+        _arg("--goal", action="store_true", dest="goal_mode", default=None,
+             help="Run the worker in a goal loop: after each turn a judge checks "
+                  "progress and the worker continues in the same session until the "
+                  "work is done or the turn budget runs out. Use to BUMP a card that "
+                  "exhausted the single-shot iteration budget (e.g. after an unblock)."),
+        _arg("--no-goal", action="store_false", dest="goal_mode",
+             help="Clear goal mode (back to classic single-shot dispatch)."),
+        _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
+             help="Turn budget for --goal workers (default 20). Ignored without --goal."),
         *_STEP_HANDOFF,
     ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [
@@ -439,7 +448,12 @@ _SPECS = [
              help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
         _arg("--log-retention-days", type=_nonnegative_int, default=30,
              help="Delete worker log files older than N days (default: 30; 0 disables)"),
-    ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
+        _arg("--run-retention-days", type=_nonnegative_int, default=0,
+             help="Delete task_runs rows older than N days for terminal tasks "
+                  "(default: 0 = disabled; run rows carry handoff summaries and the "
+                  "provider-demotion evidence, so keeping them is the conservative default). "
+                  "Windows shorter than the shared tally read window (1 day) are floored to it."),
+    ], help="Garbage-collect archived-task workspaces, old events, old logs, and old runs"),
     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
          help="Check kanban.db integrity and auto-repair index-only corruption",
          description=(
