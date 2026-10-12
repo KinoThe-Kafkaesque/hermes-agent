@@ -22,14 +22,22 @@ from scripts.code_health import cli
 from scripts.code_health.config import ENFORCEMENT
 
 REPO = Path(__file__).resolve().parents[2]
+# One entry per `_GUARDS` entry in scripts/check: these are the scripts the runner executes.
 _GUARD_SCRIPTS = (
     "scripts/check-windows-footguns.py", "scripts/check_bash_shebangs.py",
     "scripts/check_no_tmp_literals.py", "scripts/check_config_yaml_writers.py",
     "scripts/ci/check_os_marker_fakes.py", "scripts/check-case-collisions.py",
     "scripts/ci/check_lazy_deps_imports.py", "scripts/ci/check_profile_archive_boundary.py",
     "scripts/ci/check_agents_md_size.py", "scripts/ci/check_blob_size.py",
+    "scripts/ci/check_partial_index_where.py",
 )
-_SUPPORT = ("scripts/ci/profile_scope_patterns.json", "agent/subdirectory_hints.py", *_GUARD_SCRIPTS)
+# Read by the guard scripts rather than executed as one: a policy file, a module the
+# agents-md guard measures, and the topical sibling the partial-index facade imports (its arm 2
+# and the WHERE/DDL matchers both arms read), which would otherwise fail to import in the fixture.
+_SUPPORT = (
+    "scripts/ci/profile_scope_patterns.json", "agent/subdirectory_hints.py",
+    "scripts/ci/check_partial_index_where_markers.py", *_GUARD_SCRIPTS,
+)
 _LEGACY = "def legacy(x):\n" + "".join(f"    if x == {i}:\n        return {i}\n" for i in range(21))
 _GROWN = _LEGACY + "    if x == 99:\n        return 99\n"
 _ENV_COPY = "import os\n\n\ndef child_env():\n    env = os.environ.copy()\n    return env\n"
