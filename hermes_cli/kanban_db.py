@@ -1574,22 +1574,40 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
+def insert_comment_txn(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+    """Write a comment + its ``commented`` event. **Transaction-owned: fires NO observer.**
+
+    The caller owns the transaction, so the lifecycle hook must be fired by the
+    caller *after* its commit. Firing inside an outer transaction is a defect:
+    an observer reading through another connection cannot see the row yet, and a
+    later rollback leaves the external effect already delivered — see the
+    post-commit contract on ``_fire_kanban_lifecycle_hook``.
+
+    Returns the new comment id.
+    """
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not author or not author.strip():
+        raise ValueError("comment author is required")
+    _require_task(conn, task_id)
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author.strip(), body.strip(), int(time.time())),
+    )
+    _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+    return int(cur.lastrowid or 0)
+
+
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        _require_task(conn, task_id)
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
-        )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        comment_id = int(cur.lastrowid or 0)
+        comment_id = insert_comment_txn(conn, task_id, author, body)
     # Lifecycle hook AFTER the txn commits, so observers never see partial state.
     # Human input on a card is the one signal with no other delivery path: without
     # this, a reply to a blocked question (kanban_block kind=needs_input) sits
