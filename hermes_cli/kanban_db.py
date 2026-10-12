@@ -1007,6 +1007,61 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+
+-- Remote-worker board RPC.
+--
+-- One row per *mutating* request the owner executed for a remote worker, written
+-- in the SAME transaction as the mutation it describes. A retry that finds its
+-- receipt returns the stored result instead of re-running the operation, which is
+-- what makes a lost reply harmless. Committing the receipt separately from the
+-- mutation (or a "processed" marker before it) would break the property — see
+-- hermes_cli/kanban_rpc.py.
+--
+-- ``request_hash`` covers the canonical validated envelope (version, board, actor
+-- task/run, target, operation, payload) but never a credential, so rotating a
+-- capability does not change a request's identity. A reused request id with a
+-- different hash is refused as request_id_conflict rather than silently served.
+CREATE TABLE IF NOT EXISTS board_rpc_receipts (
+    board_id         TEXT NOT NULL,
+    run_id           INTEGER NOT NULL,
+    request_id       TEXT NOT NULL,
+    actor_task_id    TEXT NOT NULL,
+    target_task_id   TEXT,
+    operation        TEXT NOT NULL,
+    request_hash     BLOB NOT NULL,
+    result_json      TEXT NOT NULL,
+    committed_at     INTEGER NOT NULL,
+    PRIMARY KEY (board_id, run_id, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rpc_receipts_actor ON board_rpc_receipts(actor_task_id, run_id);
+
+-- Per-run capability grants for remote workers.
+--
+-- The owner issues a cryptographically random token when it dispatches a run to a
+-- remote host and persists only its HASH here, so the board never holds a usable
+-- credential. This is authentication; the (task, run, claim_lock) triple is a
+-- concurrency coordinate and does not authenticate anyone.
+--
+-- ``board_uuid`` is a durable board identity, not a filesystem path or slug: a
+-- path is not a stable identity across hosts and a slug can be re-pointed.
+CREATE TABLE IF NOT EXISTS board_run_grants (
+    grant_id         TEXT PRIMARY KEY,
+    board_uuid       TEXT NOT NULL,
+    actor_task_id    TEXT NOT NULL,
+    run_id           INTEGER NOT NULL,
+    token_hash       BLOB NOT NULL,
+    profile          TEXT,
+    worker_host      TEXT,
+    allowed_ops      TEXT NOT NULL,
+    issued_at        INTEGER NOT NULL,
+    expires_at       INTEGER,
+    revoked_at       INTEGER,
+    replay_until     INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_grants_run ON board_run_grants(actor_task_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_run_grants_token ON board_run_grants(token_hash);
 """
 
 
