@@ -30,7 +30,13 @@ EXECUTIONS_FILE: Optional[Path] = None
 # ``resolved``: the job ran OK after the failure (auto); ``closed``: the operator acked the signature
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
+# A reclaim that discarded a live run's claim is its own class, not a bare ``unknown`` that reads
+# identically to a crash (#131247): the operator has to be able to tell "the run was still alive
+# when its claim was released" from "the owner died". These phrases are carried by the ledger's
+# live-owner reason constants in ``cron/executions.py``; keep the two in sync.
+STALE_LIVE_CLAIM_PHRASES = ("outlived the derived stale bound", "stale live claim")
 _FAILURE_TYPE_ORDER = (
+    ("stale_live_claim", STALE_LIVE_CLAIM_PHRASES),
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
     ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
@@ -151,6 +157,13 @@ def _classify_failure_type(error: str) -> str:
             elif pattern in text:
                 return kind
     return "unknown"
+
+
+# A reclaim that discarded a live run's claim is its own class, not a bare ``unknown`` that reads
+# identically to a crash (#131247): the operator has to be able to tell "the run was still alive
+# when its claim was released" from "the owner died". These phrases are carried by the ledger's
+# live-owner reason constants in ``cron/executions.py``; keep the two in sync.
+STALE_LIVE_CLAIM_PHRASES = ("outlived the derived stale bound", "stale live claim")
 
 
 def upsert_incident(

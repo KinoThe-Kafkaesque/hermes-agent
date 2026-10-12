@@ -42,8 +42,11 @@ _AUTH_RE = re.compile(
 )
 
 # Ordered (predicate, class) rules; first match wins. Auth uses word boundaries so
-# "oauth"/"tokenizer"/"HTTP 4015" do not false-positive.
+# "oauth"/"tokenizer"/"HTTP 4015" do not false-positive. A reclaim that released a still-live
+# run's claim is its own class (#131247) — it must not read as the crash class, because the run
+# had produced work that the reclaim discarded.
 _CRON_ERROR_RULES: tuple[tuple[Callable[[str], bool], str], ...] = (
+    (lambda s: _contains_any("outlived the derived stale bound", "stale live claim")(s), "stale_live_claim"),
     (lambda s: _AUTH_RE.search(s) is not None, "auth_failed"),
     (_contains_any("rate limit", "429", "quota"), "rate_limited"),
     (_contains_any("timeout", "timed out"), "timeout"),

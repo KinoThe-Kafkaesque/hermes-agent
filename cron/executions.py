@@ -16,7 +16,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -29,8 +29,16 @@ from hermes_cli.observability.shared_metrics_gateway import record_cron_finish
 EXECUTIONS_FILE: Optional[Path] = None
 MAX_TERMINAL_EXECUTIONS = 1000
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
-# Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
-LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
+# Sample sizes for the live-owner bound's two measured terms (#131247); see
+# _live_owner_stale_after_seconds.
+LIVE_OWNER_CADENCE_SAMPLE = 20
+LIVE_OWNER_RUNTIME_SAMPLE = 200
+# Headroom multipliers over the two MEASURED terms of the live-owner bound: the job's own
+# schedule period and the p95 wall-clock duration of its recent terminal attempts. Both exist so
+# the bound cannot land on (or below) the job's own cadence — the shape that reclaimed a healthy
+# 122-minute run of a 120-minute job mid-flight (#131247).
+LIVE_OWNER_CADENCE_HEADROOM = 2.0
+LIVE_OWNER_RUNTIME_HEADROOM = 2.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -167,13 +175,123 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return start_time_fingerprints_match(started_at, current)
 
 
-def _live_owner_stale_after_seconds() -> Optional[float]:
+def _live_owner_heartbeat_is_fresh(job_id: str, row_claimed_at: str) -> bool:
+    """True when *job_id*'s durable ``fire_claim`` heartbeat proves a live run RIGHT NOW.
+
+    Claim age alone cannot distinguish "wedged since the claim" from "still working", and it is
+    the only signal the bound had — so a job whose period equals the bound was reclaimed
+    mid-flight (#131247). The run's own heartbeat thread refreshes ``fire_claim.at`` every
+    ``_RUN_CLAIM_HEARTBEAT_SECONDS`` (60 s) for as long as the run is alive, and
+    ``mark_job_run`` clears the claim at terminal completion; a wedged worker stops refreshing.
+    A fresh stamp is therefore positive evidence of liveness, and its ABSENCE (or an unreadable
+    store) is not evidence of death: return False and let the derived bound decide.
+
+    The stamp is per-job and per-run: it is only credited while the claim is younger than the
+    row being judged, so a later fire's heartbeat can never rescue an older wedged row.
+    """
+    try:
+        from cron.jobs import get_job
+        from cron.occurrences import scheduled_instant
+
+        job = get_job(job_id)
+    except Exception:  # health: allow BLE001 -- an unreadable job store is not proof of death
+        return False
+    if not job:
+        return False
+    claim = job.get("fire_claim")
+    if not isinstance(claim, dict):
+        return False
+    stamped = scheduled_instant(claim.get("at"))
+    claimed = scheduled_instant(row_claimed_at)
+    # Only credit a stamp belonging to THIS row's run: a later fire's heartbeat must never
+    # rescue an older wedged row.
+    if stamped is None or claimed is None or stamped < claimed:
+        return False
+    age = (_hermes_now() - datetime.fromisoformat(stamped)).total_seconds()
+    return age < _live_owner_heartbeat_window_seconds()
+
+
+def _live_owner_heartbeat_window_seconds() -> float:
+    """How fresh ``fire_claim.at`` must be to count as a live heartbeat.
+
+    Derived from the run's own refresh cadence (``_RUN_CLAIM_HEARTBEAT_SECONDS``, 60 s) times the
+    same 3× headroom the claim TTLs use, so a heartbeat that slips a tick or two still counts.
+    """
+    try:
+        from cron.scheduler import _RUN_CLAIM_HEARTBEAT_SECONDS as cadence
+    except ImportError:  # scheduler is imported lazily; its absence is not a fatal condition
+        cadence = 60.0
+    return float(cadence) * CLAIM_TTL_INACTIVITY_HEADROOM
+
+
+def _job_schedule_period_seconds(job_id: str) -> Optional[float]:
+    """The job's own schedule period in seconds, or None when it is not a recurring job.
+
+    Measured, not guessed: ``cron.jobs._schedule_cadence_seconds`` is the same reader the
+    catch-up grace window uses, so the bound and the grace window cannot disagree about how long
+    one period of this job is.
+    """
+    try:
+        from cron.jobs import _schedule_cadence_seconds, get_job
+
+        job = get_job(job_id)
+        if not job:
+            return None
+        period = _schedule_cadence_seconds(job.get("schedule") or {})
+    except Exception:  # health: allow BLE001 -- an unreadable job store has no period to derive
+        return None
+    if period is None or not math.isfinite(period) or period <= 0:
+        return None
+    return float(period)
+
+
+def _job_runtime_p95_seconds(conn: sqlite3.Connection, job_id: str) -> Optional[float]:
+    """p95 wall-clock duration (seconds) of this job's recent terminal attempts, or None.
+
+    The measured runtime envelope: a healthy run of this job routinely lands here, so a bound at
+    twice p95 cannot fire on normal work. ``MAX(started_at, claimed_at)`` is the start so a row
+    adopted by an external worker (``claimed_at`` stamped by the gateway, ``started_at`` by the
+    worker) measures the run, not the handoff.
+    """
+    rows = conn.execute(
+        """SELECT (julianday(finished_at) - julianday(COALESCE(started_at, claimed_at))) * 86400.0 AS s
+           FROM executions
+           WHERE job_id=? AND status IN ('completed','failed')
+             AND finished_at IS NOT NULL
+           ORDER BY julianday(claimed_at) DESC LIMIT ?""",
+        (str(job_id), LIVE_OWNER_RUNTIME_SAMPLE),
+    ).fetchall()
+    durations = sorted(
+        float(r["s"]) for r in rows if r["s"] is not None and float(r["s"]) > 0
+    )
+    if not durations:
+        return None
+    # Nearest-rank p95 (no interpolation): a real observed run, never a synthesized value.
+    rank = max(1, min(len(durations), math.ceil(0.95 * len(durations))))
+    return durations[rank - 1]
+
+
+def _live_owner_stale_after_seconds(
+    conn: sqlite3.Connection, job_id: str,
+) -> Optional[float]:
     """Age past which a claimed/running row with a LIVE owner is treated as wedged.
 
-    Derived from the existing knobs, never a bare wall-clock constant:
-    ``max(3 × HERMES_CRON_TIMEOUT, cron script timeout, 7200)``. Returns ``None`` (never reclaim
-    live owners — today's behaviour) when the inactivity timeout is 0/unlimited or not a finite
-    positive number: with no bound to derive from, fail closed.
+    Two MEASURED terms, never a bare wall-clock constant (#131247):
+
+    * the job's own schedule period (``cron.jobs._schedule_cadence_seconds``, the same reader the
+      catch-up grace window uses), and
+    * the p95 wall-clock duration of the job's recent terminal attempts.
+
+    plus the existing derived ceilings ``3 × HERMES_CRON_TIMEOUT`` and the cron script timeout.
+    Each measured term carries 2× headroom. Because the cadence term is included, the bound is
+    strictly greater than one full period of the job by construction, so a healthy run that
+    legitimately exceeds its own interval — the exact shape #131247 reclaimed mid-flight — can
+    never be reclaimed by age alone; and because the p95 term is included, a job whose runs
+    normally take most of a period is bounded above its real envelope rather than at a fixed
+    2 h.
+
+    Returns ``None`` (never reclaim live owners) when the inactivity timeout is 0/unlimited or
+    not a finite positive number: with no bound to derive from, fail closed.
     """
     from cron.scheduler import _cron_inactivity_seconds
     from cron.scheduler_script import _get_script_timeout
@@ -181,11 +299,17 @@ def _live_owner_stale_after_seconds() -> Optional[float]:
     inactivity = float(_cron_inactivity_seconds())
     if not math.isfinite(inactivity) or inactivity <= 0:
         return None
-    return max(
+    terms = [
         inactivity * CLAIM_TTL_INACTIVITY_HEADROOM,
         float(_get_script_timeout()),
-        LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS,
-    )
+    ]
+    period = _job_schedule_period_seconds(job_id)
+    if period is not None:
+        terms.append(period * LIVE_OWNER_CADENCE_HEADROOM)
+    runtime_p95 = _job_runtime_p95_seconds(conn, job_id)
+    if runtime_p95 is not None:
+        terms.append(runtime_p95 * LIVE_OWNER_RUNTIME_HEADROOM)
+    return max(terms)
 
 
 def _claim_age_seconds(claimed_at: str) -> float:
@@ -334,50 +458,78 @@ _OWNER_GONE_REASON = (
     "Scheduler restarted after this execution's owner exited before a durable "
     "terminal state; whether side effects ran is unknown."
 )
+# A live owner whose claim outlived the bound for THIS job, while its own heartbeat had stopped.
+# Distinct from the crash class above and from the stale-claim class below: this one names a
+# genuinely stopped run, so the operator can tell "wedged worker" from "the scheduler was
+# restarted" (a report-discarding reclaim that used to be filed as a bare ``unknown``, #131247).
 _OWNER_WEDGED_REASON = (
-    "Owner process is still alive but the claim outlived the derived stale bound; "
-    "treated as wedged (#115692). The process was not terminated; whether side effects "
-    "ran is unknown."
+    "Owner process is still alive but the claim outlived the derived stale bound and its "
+    "heartbeat stopped; treated as wedged (#115692). The process was not terminated; whether "
+    "side effects ran is unknown."
 )
+
+
+def _live_owner_reclaim_plan(
+    rows: List[sqlite3.Row],
+) -> Dict[Tuple[str, str], str]:
+    """Decide, per live-owned open row, which reclaim reason (if any) applies.
+
+    Deliberately runs OUTSIDE the ledger transaction: the bound reads the job store
+    (``cron.jobs.get_job`` → ``_jobs_lock``), and ``mark_job_run`` already calls into this module
+    while holding that lock, so a job-store read inside ``_transaction()`` would invert the lock
+    order and deadlock. Returns ``{(job_id, claimed_at): reason}``; absent means "leave owned".
+    """
+    plan: Dict[Tuple[str, str], str] = {}
+    bounds: Dict[str, Optional[float]] = {}
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        if not _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            plan[(str(row["job_id"]), row["claimed_at"])] = _OWNER_GONE_REASON
+            continue
+        # A live owner is normally a legitimately running job. A worker permanently deadlocked
+        # (e.g. futex_wait behind a route/proxy flip, #115692) also passes this check — but so
+        # does a healthy long run, which is why age alone is not enough (#131247): the run's own
+        # fire_claim heartbeat is consulted first, and a fresh stamp keeps the row owned however
+        # old the claim is.
+        if _live_owner_heartbeat_is_fresh(str(row["job_id"]), row["claimed_at"]):
+            continue
+        job_id = str(row["job_id"])
+        if job_id not in bounds:
+            with _transaction() as conn:
+                bounds[job_id] = _live_owner_stale_after_seconds(conn, job_id)
+        bound = bounds[job_id]
+        if bound is None or _claim_age_seconds(row["claimed_at"]) <= bound:
+            continue
+        plan[(job_id, row["claimed_at"])] = _OWNER_WEDGED_REASON
+    return plan
 
 
 def recover_interrupted_executions() -> int:
     """Mark abandoned attempts unknown without scheduling retries: rows whose owner is provably
-    dead, plus rows whose live owner holds a claim older than the derived stale bound (the
-    process is not killed)."""
+    dead, plus rows whose live owner holds a claim older than the bound derived from that job's
+    own cadence and runtime envelope (the process is not killed). A live owner whose own
+    heartbeat is still fresh is never reclaimed, whatever its claim age (#131247)."""
     now = _hermes_now().isoformat()
     changed = 0
     recovered: List[Dict[str, Any]] = []
-    # Derived on the first live-owned row only: the bound reads config, and the idle gateway
-    # tick must stay config-free (tests/cron/test_idle_tick_config_skip.py).
-    stale_after: Optional[float] = None
-    stale_after_resolved = False
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
+            """SELECT id, job_id, status, process_id, pid, process_started_at,
                       handoff_pending, handoff_started_at, claimed_at
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
+    if not rows:
+        return 0
+    # Job-store reads (heartbeat + cadence) happen here, outside the ledger transaction, so the
+    # lock order stays ledger-after-jobs (mark_job_run holds _jobs_lock while calling in).
+    plan = _live_owner_reclaim_plan(rows)
+    with _transaction() as conn:
         for row in rows:
-            if row["process_id"] == _PROCESS_ID:
+            reason = plan.get((str(row["job_id"]), row["claimed_at"]))
+            if reason is None:
                 continue
-            reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                # A live owner is normally a legitimately running job. A worker permanently
-                # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
-                # this check, so a claim older than the derived bound is treated as wedged
-                # and released — the external-worker wait loop polls this ledger for a
-                # terminal status, so the job can fire again. The wedged worker PROCESS is
-                # NOT terminated here (leaked until host restart); rows owned by this process
-                # (process_id == _PROCESS_ID, in-process runs) are skipped above and remain
-                # out of scope.
-                if not stale_after_resolved:
-                    stale_after = _live_owner_stale_after_seconds()
-                    stale_after_resolved = True
-                if stale_after is None or _claim_age_seconds(row["claimed_at"]) <= stale_after:
-                    continue
-                reason = _OWNER_WEDGED_REASON
             handoff_started_at = row["handoff_started_at"]
             if (
                 row["handoff_pending"]

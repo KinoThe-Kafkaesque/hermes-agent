@@ -101,3 +101,37 @@ def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
 
     missing = snapshot_names - registered
     assert not missing, f"gauges emitted but NOT registered in metric_names (will be silently dropped): {sorted(missing)}"
+
+
+def test_documented_error_class_enum_matches_the_classifier():
+    """The `hermes.error_class = ...` list in the developer guide IS the classifier's vocabulary.
+
+    The guide documents these as a CLOSED enum ("Anything not in the set is coerced to `unknown`
+    on the way out, so a new value that is not added to the set is invisible") and requires the
+    list and the classifier to be updated together. Binding the two by hand drifts silently the
+    moment either side is edited, so the doc's own list is parsed and asserted set-equal here.
+    """
+    import re
+    from pathlib import Path
+
+    from agent.monitoring.cron_health import _CRON_ERROR_RULES, classify_cron_error
+
+    doc = Path(__file__).resolve().parents[2] / "website/docs/developer-guide/gateway-monitoring.md"
+    text = doc.read_text(encoding="utf-8")
+    # The documented enum block: `hermes.error_class = a|b|` continued over `|`-joined lines.
+    match = re.search(r"hermes\.error_class\s*=\s*((?:[^\n]*\|\s*\n)*[^\n]*)", text)
+    assert match, "the `hermes.error_class = ...` list is missing from the guide"
+    documented = {
+        part.strip() for part in match.group(1).replace("\n", " ").split("|") if part.strip()
+    }
+
+    code_side = {label for _predicate, label in _CRON_ERROR_RULES} | {"unknown"}
+
+    assert documented == code_side, (
+        "documented hermes.error_class enum disagrees with classify_cron_error's buckets: "
+        f"doc-only={sorted(documented - code_side)} code-only={sorted(code_side - documented)}"
+    )
+    # Both directions are real: the documented set is what an operator filters on, and the
+    # classifier must actually be able to produce each documented label.
+    assert classify_cron_error("Owner process is still alive but the claim outlived the derived "
+                              "stale bound and its heartbeat stopped") == "stale_live_claim"
