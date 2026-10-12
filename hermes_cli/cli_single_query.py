@@ -512,7 +512,11 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
     # isn't engaged) and takes the deterministic approvals.single_query_mode path instead of waiting the
     # full timeout. See #86878.
     os.environ["HERMES_SINGLE_QUERY_SESSION"] = "1"
-    from hermes_cli.quiet_single_query import exit_single_query
+    from hermes_cli.quiet_single_query import bind_exit_trailer_cli, exit_single_query
+    # Publish this CLI so the worker's exit trailer can name the provider/model
+    # that served the run (the kanban dispatcher attributes rate-limit walls by
+    # provider). Both one-shot paths exit through ``exit_single_query``.
+    bind_exit_trailer_cli(cli)
     if os.environ.get("HERMES_KANBAN_TASK"):
         from tools.kanban_tools import register_current_worker_from_env
         if not register_current_worker_from_env():
