@@ -166,6 +166,11 @@ def lazy_installs_allowed() -> bool:
     setting is security.allow_lazy_installs in config.yaml; a config
     system that fails to load counts as ALLOWED only when hermes_cli is
     genuinely absent (bootstrap) — config errors fail closed.
+
+    The read goes through :mod:`pm.config_policy`, NOT ``hermes_cli.config``:
+    importing that module runs bundled model-provider plugin discovery, which
+    drags the whole application (and any third-party dependency a plugin
+    reaches) into a runtime declared as independent of it.
     """
     import os
 
@@ -175,18 +180,18 @@ def lazy_installs_allowed() -> bool:
         "yes",
     ):
         return False
+    from pm import config_policy
+
     try:
-        from hermes_cli.config import cfg_get, load_config_readonly, require_readable_config_before_write
+        return config_policy.allow_lazy_installs() is True
     except ModuleNotFoundError as exc:
         return exc.name in {"hermes_cli", "hermes_cli.config"}
     except ImportError:
         return False
-    try:
-        # The normal loader falls back to defaults on invalid YAML. A broken
-        # security policy must not grant permission to acquire dependencies.
-        require_readable_config_before_write()
-        return cfg_get(load_config_readonly(), "security", "allow_lazy_installs", default=True) is True
-    except Exception:
+    except Exception:  # health: allow BLE001 -- a security policy that cannot be read must fail CLOSED, so every reader failure (OSError/UnicodeDecodeError/YAMLError/non-mapping) has to land here; narrowing it would turn a broken config.yaml into permission to acquire packages
+        # A broken security policy must not grant permission to acquire
+        # dependencies: an unreadable, unparseable or non-mapping config.yaml
+        # fails closed, exactly as the previous loader did.
         return False
 
 
