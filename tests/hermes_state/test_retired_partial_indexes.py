@@ -35,15 +35,35 @@ Each test:
      then restores the SHIPPED composite and asserts correctness;
   3. for a KEPT-PARTIAL site, asserts the shipped DDL is still the partial form and
      that it is still the CHOSEN plan for its own consumer query.
+
+The kept-partial markers carry an honesty condition — the columns their partial ``WHERE``
+equates to a literal are never bound with ``=`` in a PREDICATE by production — and that
+condition is what makes the hazard unreachable for them. It used to be enforced by nothing.
+It now has two arms: the mechanical one in ``scripts/ci/check_partial_index_where.py``
+(derived from the marked DDL, wired into ``scripts/check`` and CI) and the in-suite
+behavioural one here, which applies the same condition to the statements the tree actually
+hands to SQLite.
 """
 
 from __future__ import annotations
 
+import ast
+import re
 import sqlite3
+import subprocess
+from pathlib import Path
 
 import pytest
 
 from hermes_state import SessionDB
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The guard's own inventory scope, restated so the in-suite arm reads the same file set.
+_GUARD_EXCLUDED_PREFIXES = (
+    "tests/", "tests-js/", "evals/", "website/", "optional-skills/",
+    "skills/", "native/", "node_modules/", "plugin-catalog/",
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -243,8 +263,126 @@ _KEPT_PARTIAL = (
     "idx_messages_session_uid",
 )
 
-# The columns these partial predicates key on. Production must never bind one with '='.
+# The columns these partial predicates key on. Production must never bind one with '='
+# IN A PREDICATE. That condition is what makes the hazard unreachable for the kept-partial
+# sites, and ``scripts/ci/check_partial_index_where.py`` now enforces it (deriving the same
+# set from the marked DDL) — the guard is the mechanical arm; the two tests below are the
+# in-suite behavioural arm, so a guard that silently stopped running would still show up.
 _NEVER_BOUND_COLUMNS = ("active", "compacted")
+
+# Every placeholder spelling SQLite accepts, and every position a bind can sit in. The
+# point is that the SET-target exclusion below is DISCRIMINATING: ``UPDATE messages SET
+# active = ?`` is a shipped production statement, so a matcher that did not exclude SET
+# targets would report it and this file would fail on its own repo.
+_PLACEHOLDER = r"(?:\?\d*|:[A-Za-z_]\w*|@[A-Za-z_]\w*|\$[A-Za-z_]\w*)"
+_BOUND_IN_PREDICATE = re.compile(
+    r"(?<![!<>=])(?:\b\w+\.)?\b(%s)\b\s*=\s*%s" % ("|".join(_NEVER_BOUND_COLUMNS), _PLACEHOLDER)
+)
+_BOUND_IN_PREDICATE_REVERSED = re.compile(
+    _PLACEHOLDER + r"\s*=\s*(?:\b\w+\.)?\b(%s)\b" % "|".join(_NEVER_BOUND_COLUMNS)
+)
+_SET_KEYWORD = re.compile(r"\bSET\b", re.IGNORECASE)
+_SET_CLAUSE_END = re.compile(
+    r"\b(WHERE|FROM|RETURNING|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|VALUES)\b", re.IGNORECASE
+)
+
+
+def _predicate_binds(sql: str) -> list[str]:
+    """Marked columns bound with a placeholder in PREDICATE position in *sql*.
+
+    Statements are split on ``;`` AFTER line comments are blanked, so a ``;`` inside a
+    comment cannot split one, and a ``-- …`` between a name and the rest of the statement
+    does not hide it. The ``SET`` target list is excluded: a SET target is a write, not a
+    predicate the planner can fold into the partial index — measured, ``UPDATE t SET a =
+    ?`` does not reproduce the anomaly (the written data matches a fresh connection).
+    """
+    blanked = re.sub(r"--[^\n]*", lambda m: " " * len(m.group(0)), sql)
+    found: list[str] = []
+    for stmt in blanked.split(";"):
+        spans: list[tuple[int, int]] = []
+        for match in _SET_KEYWORD.finditer(stmt):
+            end = _SET_CLAUSE_END.search(stmt, match.end())
+            spans.append((match.end(), end.start() if end else len(stmt)))
+        for pattern in (_BOUND_IN_PREDICATE, _BOUND_IN_PREDICATE_REVERSED):
+            for match in pattern.finditer(stmt):
+                column = match.group(1).lower()
+                if any(start <= match.start() < end for start, end in spans):
+                    continue
+                if column not in found:
+                    found.append(column)
+    return found
+
+
+def test_no_production_statement_binds_a_kept_partial_column():
+    """The markers' honesty condition, driven over the real statements the tree ships.
+
+    Source-scanning is banned in ``tests/AGENTS.md``, and this is not that: it does not
+    assert anything about the SHAPE of the source. It reads the statements the code
+    EXECUTES (the string constants the modules hand to SQLite) and applies the marker's
+    own condition to them — the same predicate the guard applies, so the guard going
+    missing is caught here rather than only in CI.
+
+    GREEN today; RED the moment a production statement binds ``active`` or ``compacted``
+    with a placeholder in a predicate on ``messages``.
+    """
+    offenders: list[str] = []
+    for relpath in _production_python_files():
+        source = (REPO_ROOT / relpath).read_text(encoding="utf-8-sig", errors="replace")
+        for lineno, text in _string_constants(source):
+            if "messages" not in text:
+                continue
+            for column in _predicate_binds(text):
+                offenders.append(f"{relpath}:{lineno}: {column} = <placeholder>")
+    assert not offenders, (
+        "a kept-partial index's `partial-index: ok` marker claims these columns are never"
+        " bound with `=` in a predicate, but production does:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_the_predicate_scan_excludes_a_set_target():
+    """The scan above is only meaningful if its SET exclusion actually works.
+
+    ``hermes_state_portability`` ships ``UPDATE messages SET active = 0, compacted = ?``
+    — a real bind of a marked column, in a real production statement. If the exclusion
+    were removed, the test above would red on its own repo for a bind that measured NOT
+    to reproduce the anomaly; this pins that it does not.
+    """
+    assert _predicate_binds("UPDATE messages SET active = 0, compacted = ? WHERE id = ?") == []
+    # …and that the same bind in PREDICATE position is still caught.
+    assert _predicate_binds("SELECT id FROM messages WHERE active = ?") == ["active"]
+    assert _predicate_binds("SELECT id FROM messages WHERE ? = compacted") == ["compacted"]
+
+
+def _production_python_files() -> list[str]:
+    """Tracked production ``*.py`` — the same inventory the guard uses."""
+    out = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z", "--", "*.py"],
+        capture_output=True, check=True,
+    ).stdout.decode(errors="replace").split("\0")
+    return sorted(
+        n.replace("\\", "/") for n in out
+        if n.endswith(".py") and not n.replace("\\", "/").startswith(_GUARD_EXCLUDED_PREFIXES)
+    )
+
+
+def _string_constants(source: str):
+    """``(lineno, text)`` for every string constant, f-strings contributing literal parts."""
+    tree = ast.parse(source)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = getattr(node, "body", None)
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docstrings.add(id(body[0].value))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+            yield node.lineno, node.value
+        elif isinstance(node, ast.JoinedStr):
+            yield node.lineno, "".join(
+                part.value for part in node.values
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
 
 
 def test_display_indexes_keep_their_partial_form(db):

@@ -686,10 +686,13 @@ CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 #
 # These three indexes and idx_messages_session_uid keep their partial form on purpose:
-# their WHERE columns (``active`` / ``compacted``) are NEVER bound with ``=`` by any
-# production statement (measured: the only writes are ``SET active = 0, compacted = ?``
-# in hermes_state_portability), so the reused-statement anomaly the guard refuses is
-# UNREACHABLE for them — the ``partial-index: ok`` marker on each documents that.
+# their WHERE columns (``active`` / ``compacted``) are never bound with ``=`` in a
+# PREDICATE by any production statement (measured: the only writes are
+# ``SET active = 0, compacted = ?`` in hermes_state_portability, a SET target rather
+# than a predicate), so the reused-statement anomaly the guard refuses is UNREACHABLE
+# for them — the ``partial-index: ok`` marker on each documents that, and
+# ``scripts/ci/check_partial_index_where.py`` ENFORCES it (a statement binding either
+# column with a placeholder on ``messages`` fails the guard).
 # Making them composite also REGRESSES test_display_paging_and_append_work_is_bounded:
 # the partial predicate is empty on a fully-backfilled session, so the display pre-read
 # probe (_DISPLAY_INDEX_MISSING_SQL, LIMIT 1) short-circuits; a full composite makes that
@@ -700,10 +703,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_display_page
     ON messages(session_id, display_order, active DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_display_backfill -- partial-index: ok — active/compacted are never bound with '=' in production (measured)
+CREATE INDEX IF NOT EXISTS idx_messages_display_backfill -- partial-index: ok — active/compacted are never bound with '=' in a PREDICATE in production (measured; enforced by scripts/ci/check_partial_index_where.py)
     ON messages(session_id) WHERE (display_order IS NULL OR display_identity IS NULL)
     AND (active = 1 OR compacted = 1);
-CREATE INDEX IF NOT EXISTS idx_messages_display_identity -- partial-index: ok — active/compacted are never bound with '=' in production (measured)
+CREATE INDEX IF NOT EXISTS idx_messages_display_identity -- partial-index: ok — active/compacted are never bound with '=' in a PREDICATE in production (measured; enforced by scripts/ci/check_partial_index_where.py)
     ON messages(session_id, display_identity, display_order)
     WHERE display_identity IS NOT NULL AND (active = 1 OR compacted = 1);
 DROP TRIGGER IF EXISTS messages_message_uid_insert;
@@ -784,10 +787,12 @@ END;
 CREATE INDEX IF NOT EXISTS idx_messages_active_null
     ON messages(active) WHERE active IS NULL;
 -- Logical-identity recovery (agent.transcript_repair._active_logical_message_row) runs inside the write lock.
--- active is never bound with '=' in production (measured), so the hazard is unreachable; the
+-- active is never bound with '=' in a PREDICATE in production (measured; the one
+-- bind is a SET target in hermes_state_portability), so the hazard is unreachable
+-- and scripts/ci/check_partial_index_where.py enforces that; the
 -- partial predicate is load-bearing for the display pre-read probe, so the composite regresses
 -- the paging budget test (see the DEFERRED_INDEX_SQL note above).
-CREATE INDEX IF NOT EXISTS idx_messages_session_uid -- partial-index: ok — active/compacted are never bound with '=' in production (measured)
+CREATE INDEX IF NOT EXISTS idx_messages_session_uid -- partial-index: ok — active/compacted are never bound with '=' in a PREDICATE in production (measured; enforced by scripts/ci/check_partial_index_where.py)
     ON messages(session_id, message_uid) WHERE active = 1;
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
     ON sessions(session_key, started_at DESC);

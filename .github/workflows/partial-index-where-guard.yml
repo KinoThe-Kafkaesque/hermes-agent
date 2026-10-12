@@ -15,6 +15,15 @@ name: Partial-index WHERE guard
 # inventory from `git ls-files`, so it can never pass by scanning nothing — an
 # inventory failure or an unparseable tracked file exits 2.
 #
+# A second arm makes the `partial-index: ok` opt-out FALSIFIABLE. The marker claims
+# the index's WHERE column is never bound with `=` by production; that claim is what
+# makes the anomaly unreachable for the kept-partial sites, and nothing enforced it.
+# The arm derives the marked columns and tables FROM the marked DDL and refuses any
+# tracked production string constant that binds one of those columns with a
+# placeholder (`?`, `?1`, `:name`, `@name`, `$name`) in a PREDICATE position on the
+# marked table. A `SET` target is out of scope: measured, `UPDATE t SET col = ?`
+# does NOT reproduce the anomaly (the written data matches a fresh connection).
+#
 # The live tree already carries pre-existing sites, so the checker keeps a
 # `_BASELINE` burn-down list (same convention as check_no_tmp_literals.py): a file
 # that GAINS a hit fails; a stale entry is an advisory so parallel clean-ups do
