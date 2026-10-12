@@ -4279,8 +4279,11 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     claimed = claim_job_for_fire(job["id"], return_job=True)
     if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        # A refusal must RESOLVE the occurrence it was handed, or the next scan restores the
+        # same instant and re-refuses it — one row per tick (cron/claim_refusal.py).
+        from cron.claim_refusal import resolve_refused_claim
+
+        finish_execution(job["execution_id"], success=False, error=resolve_refused_claim(job))
         return True
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
@@ -4322,14 +4325,10 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     def _not_dispatched_shutdown() -> None:
         logger.warning("Job '%s' not dispatched — interpreter is shutting down", job_label)
 
-    # During interpreter shutdown pool.submit raises; skip — the job fires on the next tick.
-    # If the interpreter is finalizing (gateway SIGTERM / restart / OOM), scheduling any new delivery is
-    # futile — asyncio.run and a fresh ThreadPoolExecutor both raise "cannot schedule new futures after
-    # interpreter shutdown". Skip gracefully with a warning rather than emitting an ERROR traceback on every
-    # restart-race (#58720, #55924).
-    # A tick can race gateway teardown: once the interpreter is finalizing, ``pool.submit`` raises "cannot
-    # schedule new futures after interpreter shutdown" and crashes the tick. Skip cleanly — the job stays
-    # due and will fire on the next healthy tick (#58720, #55924).
+    # During interpreter shutdown ``pool.submit`` raises ("cannot schedule new futures after
+    # interpreter shutdown") and crashes the tick. A tick can race gateway teardown (SIGTERM,
+    # restart, OOM); skip cleanly with a warning — the job stays due and fires on the next
+    # healthy tick, rather than emitting an ERROR traceback on every restart-race (#58720, #55924).
     if _interpreter_shutting_down():
         _not_dispatched_shutdown()
         _clear_run_claim_best_effort()

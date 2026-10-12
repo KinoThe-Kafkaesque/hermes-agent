@@ -3241,13 +3241,11 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     recurring jobs; then once due: re-anchor stale cron instants, fast-forward missed recurring
     runs, retire/guard one-shots, and finally stamp the run claim / dispatch record."""
     now = scan.now
-    # Cross-process guard: another process's live one-shot run_claim (younger than TTL) — do NOT
-    # re-dispatch. Malformed/future-dated claims (clock/TZ skew) count as stale, never eternally
-    # fresh.
-    if (
-        job.get("schedule", {}).get("kind") == "once"
-        and _claim_is_live(job.get("run_claim"), now, run_claim_ttl)
-    ):
+    # Another live fire owns this job right now (one-shot run_claim / recurring fire_claim);
+    # dispatching it can only be refused, and the refusal is what wrote the per-tick rows.
+    from cron.claim_refusal import another_fire_owns
+
+    if another_fire_owns(job, now, run_claim_ttl):
         return False
 
     next_run = _restore_unclaimed_slot(job, scan) or job.get("next_run_at") or _recover_missing_next_run(job, scan)
