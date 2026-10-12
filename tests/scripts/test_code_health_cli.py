@@ -25,7 +25,8 @@ from scripts.code_health import cli
 from scripts.code_health.config import ENFORCEMENT
 
 REPO = Path(__file__).resolve().parents[2]
-# One entry per `_GUARDS` entry in scripts/check: these are the scripts the runner executes.
+# One entry per executed guard in scripts/check (`_GUARDS` plus `_DIFF_GUARDS`, which judge a
+# diff rather than a tree): these are the scripts the runner executes.
 # `test_guard_scripts_parity_with_scripts_check` parses scripts/check and enforces that claim, so
 # a newly registered guard reddens here by name instead of surfacing as an opaque `Errno 2`.
 _GUARD_SCRIPTS = (
@@ -55,12 +56,15 @@ _SWITCH = "scripts/code_health/config.py"
 
 
 def _executed_guard_scripts() -> frozenset[str]:
-    """The script each ``scripts/check`` ``_GUARDS`` entry runs, read off the module itself.
+    """The script each ``scripts/check`` guard entry runs, read off the module itself.
 
     Imported, not text-scanned: the claim under test is about the object the runner iterates,
-    so deriving from the module makes a renamed or reshaped ``_GUARDS`` a named failure here
+    so deriving from the module makes a renamed or reshaped guard table a named failure here
     instead of a silently empty comparison. ``argv[0]`` is the script (``footguns`` appends
-    ``--all``); ``_CHECKS`` also carries the two non-guard checks, so ``_GUARDS`` is the key.
+    ``--all``). BOTH executed tables count: ``_GUARDS`` judge a tree and ``_DIFF_GUARDS`` judge
+    a diff against the ratchet's base/head, but either way the fixture must carry the script —
+    which is the property ``_GUARD_SCRIPTS`` pins. ``_CHECKS`` also carries the two non-guard
+    checks, so the two guard tables are the keys.
     """
     loader = importlib.machinery.SourceFileLoader(
         "_hermes_scripts_check", str(REPO / "scripts/check"))
@@ -74,7 +78,11 @@ def _executed_guard_scripts() -> frozenset[str]:
         loader.exec_module(module)
     finally:
         sys.modules.pop(loader.name, None)
-    return frozenset(argv[0] for argv in module._GUARDS.values())
+    return frozenset(
+        argv[0]
+        for table in (module._GUARDS, module._DIFF_GUARDS)
+        for argv in table.values()
+    )
 
 
 def _engine_scripts() -> tuple[str, ...]:
