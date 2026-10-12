@@ -102,9 +102,6 @@ TICKER_INTERVAL_SECONDS = 60
 # mark_job_run / advance_next_run calls clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
-_fire_fence_locks: dict[str, threading.RLock] = {}
-_fire_fence_locks_guard = threading.Lock()
-_fire_fence_lock_state = threading.local()
 
 # Upper bound on waiting for the cross-process .jobs.lock. Every cron function funnels through
 # _jobs_lock(), so blocking forever on a wedged sibling process would freeze the ticker and every
@@ -339,83 +336,18 @@ def _jobs_lock():
             _jobs_lock_state.load_stamp = None
 
 
-@contextlib.contextmanager
-def _fire_job_lock(job_id: str):
-    """Serialize one job's owner mutations and external side effects. Unlike the global jobs lock
-    this may be held across network delivery; scoped to one profile + job so unrelated jobs keep
-    progressing. Fails closed when cross-process locking is unavailable."""
-    cron_dir = _current_cron_store().cron_dir
-    lock_key = f"{cron_dir.resolve()}::{job_id}"
-    with _fire_fence_locks_guard:
-        local_lock = _fire_fence_locks.setdefault(lock_key, threading.RLock())
-
-    if not local_lock.acquire(timeout=_JOBS_LOCK_TIMEOUT_SECONDS):
-        logger.error("Timed out waiting for local fire fence %s; failing closed", lock_key)
-        yield False
-        return
-
-    held_locks = _fire_fence_lock_state.__dict__.setdefault("held", {})
-    if lock_key in held_locks:
-        try:
-            yield held_locks[lock_key]
-        finally:
-            local_lock.release()
-        return
-
-    try:
-        ensure_dirs()
-        lock_path = cron_dir / f".fire-{uuid.uuid5(uuid.NAMESPACE_URL, lock_key).hex}.lock"
-        lock_fd = None
-        acquired = False
-        try:
-            lock_fd = open(lock_path, "a+", encoding="utf-8")
-            lock_fd.seek(0)
-            result = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
-            if result is None:  # pragma: no cover - supported platforms provide one backend
-                logger.error("No cross-process lock backend for cron fire fence")
-            elif not result:
-                logger.error("Timed out waiting for fire fence %s; failing closed", lock_path)
-            acquired = bool(result)
-        except OSError as exc:
-            logger.error("Cron fire fence unavailable for %s: %s", job_id, exc)
-
-        held_locks[lock_key] = acquired
-        try:
-            yield acquired
-        finally:
-            held_locks.pop(lock_key, None)
-            if lock_fd is not None:
-                if acquired:
-                    _release_flock(lock_fd)
-                else:
-                    lock_fd.close()
-    finally:
-        local_lock.release()
-
-
-def _under_fire_fence(job_id: str, fn: Callable[[], Any]) -> Any:
-    """Run ``fn()`` holding the job's fire fence; False (fail closed) when it can't be acquired."""
-    with _fire_job_lock(job_id) as acquired:
-        if not acquired:
-            return False
-        return fn()
-
-
-@contextlib.contextmanager
-def fire_claim_fence(job_id: str, *, expected_owner: str):
-    """Hold a per-job fence while an owner performs an external side effect. A missing record
-    is accepted only for the active run that removed this exact job (#111039)."""
-    with _fire_job_lock(job_id) as acquired:
-        if not acquired:
-            yield False
-            return
-        with _jobs_lock():
-            job = next((item for item in load_jobs() if item.get("id") == job_id), None)
-            claim = job.get("fire_claim") if isinstance(job, dict) else None
-            owns_claim = isinstance(claim, dict) and claim.get("by") == expected_owner
-            if job is None:
-                owns_claim = self_removal_delivery_allowed(job_id)
-        yield owns_claim
+# The per-job fire fence lives in its own topical module (cron/fire_fence.py): it carries the
+# bound on how long a holder may keep a flock no live fire claim justifies, and this facade is at
+# its FILE_LINES cap. Re-exported here because every caller and test reaches it by this path.
+from cron.fire_fence import (
+    _fire_fence_lock_state,
+    _fire_fence_locks,
+    _fire_fence_locks_guard,
+    _fire_job_lock,
+    _under_fire_fence,
+    fire_claim_fence,
+    get_fire_fence_overrun_stats,
+)
 
 
 # Fields that must never change after creation: ``id`` is a path component under OUTPUT_DIR, so an

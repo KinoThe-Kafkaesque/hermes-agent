@@ -43,6 +43,17 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
+- **The fire fence is bounded by the claim lease it serves, not by a hold ceiling.** The per-job
+  fence (`cron/fire_fence.py`) serializes one job's claim, terminal write and side effects. On the
+  CLAIM path (`_under_fire_fence`) a cross-process wait that outlives its budget while no LIVE
+  `fire_claim` justifies the fence is recorded (`fire_fence_overruns.jsonl` + an ERROR) and
+  abandoned — the fence is unowned then, and the path's real authority is the CAS under
+  `.jobs.lock` plus `mark_job_run`'s owner fence. A live claim keeps the fence authoritative, so
+  at-most-once is untouched. SIDE-EFFECT holds (`fire_claim_fence`) always fail closed: a delivery
+  that ran without exclusivity could land after the terminal write it must linearize against. Why:
+  an unbounded holder (measured 2026-10-10, job `f97cff5541c4`) cost a due occurrence — the waiter
+  burned its full 30 s budget, failed closed, and the occurrence was refused. Never widen the bound
+  to the in-process lock or to side-effect holds.
 - **The ticker binds each served profile's scope for the whole tick, including pre-loop code.**
   `scheduler_provider.py::_start_multiplex` is ONE ticker iterating `profiles_to_serve()`
   sequentially under `_profile_cron_scope(home)` (home + secret scope + terminal scope) — never N
