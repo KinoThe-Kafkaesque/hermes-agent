@@ -2,8 +2,13 @@
 """Fail when a partial index's ``WHERE`` compares a column to a scalar literal,
 and when a ``partial-index: ok`` opt-out stops being true.
 
-Two arms, one file. Both are needed; either alone is a green light for a
-different hole.
+Two arms, one guard. Both are needed; either alone is a green light for a
+different hole. Arm 1 lives here; arm 2 and the WHERE/DDL matcher primitives both
+arms read live in the topical sibling
+``scripts/ci/check_partial_index_where_markers.py``, which this facade imports —
+so the dependency runs one way and the two can never form a cycle. (The split is
+what brought this file's ``main`` back under the repo's ``CC`` cap: it read 16
+before arm 2 landed and 24 after, against a target of 20.)
 
 **Arm 1 (DDL shape).** Refuses a partial index whose ``WHERE`` compares a column
 to a scalar literal. A ``CREATE INDEX ... WHERE <col> = <literal>`` (or
@@ -45,15 +50,12 @@ indexed column is never bound with ``=`` by a production statement, and that
 assertion is the ONLY reason the anomaly is unreachable for the kept-partial sites.
 Nothing enforced it: the marker could stay present — arm 1 green — while a new
 writer bound the column with ``=``, making every marker on that column silently
-FALSE. Arm 2 derives the column set FROM the marked DDL (so a new marker widens
-what is enforced automatically) and refuses any tracked production string constant
-that binds one of those columns with a **placeholder** (``?``, ``?1``, ``:name``,
-``@name``, ``$name``) in a **predicate** position — outside a ``SET`` target list,
-which is a write rather than a predicate the planner can fold into the partial
-index — in a statement that references the marked index's TABLE. Measured: the
-shipped tree binds neither ``active`` nor ``compacted`` with a placeholder in any
-position, so it is GREEN; a synthetic ``WHERE ... active = ?`` on ``messages`` reds
-it and names the site.
+FALSE. Arm 2 (in the sibling) derives the column set FROM the marked DDL and refuses
+any tracked production string constant that binds one of those columns with a
+placeholder in a PREDICATE position on the marked table. Measured: the shipped tree
+binds neither ``active`` nor ``compacted`` with a placeholder in any position, so it
+is GREEN; a synthetic ``WHERE ... active = ?`` on ``messages`` reds it and names the
+site.
 
 Measured detail that matters for the allow-list: the hazard is NOT restricted to
 the indexed column (``ON t(b) WHERE a='x'`` mis-serves), and the safe spellings
@@ -87,66 +89,22 @@ from __future__ import annotations
 
 import argparse
 import ast
-import re
 import subprocess
 import sys
 from pathlib import Path
 
-MARKER = "partial-index: ok"
+# The sibling is imported as ``scripts.ci.…``; ``scripts/ci`` carries no ``__init__.py``, so the
+# repo root must be on sys.path — it is not sys.path[0] when this facade is the entry point.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-# Placeholder spellings SQLite accepts in a parameterized statement.
-_PLACEHOLDER = r"(?:\?\d*|:[A-Za-z_]\w*|@[A-Za-z_]\w*|\$[A-Za-z_]\w*)"
+from scripts.ci import check_partial_index_where_markers as markers  # noqa: E402
 
-# ``col = <placeholder>`` in PREDICATE position — the bind that makes a marked
-# partial index's opt-out false. ``(?<![!<>=])`` keeps the safe comparison
-# operators (``!=``/``<=``/``>=``/``<>``) out, which do NOT reproduce the anomaly.
-_BOUND_EQUALS = re.compile(
-    r"(?<![!<>=])(?:\b\w+\.)?\b([A-Za-z_]\w*)\b\s*=\s*" + _PLACEHOLDER
-)
-# The reversed operand order, ``<placeholder> = col``, reproduces it identically
-# (measured) and is a different spelling of the same bind, so it needs its own arm.
-_BOUND_EQUALS_REVERSED = re.compile(
-    _PLACEHOLDER + r"\s*=\s*(?:\b\w+\.)?\b([A-Za-z_]\w*)\b"
-)
-
-# A ``SET`` clause is a write target, not a predicate the planner can fold into a
-# partial index — ``UPDATE t SET a = ?`` measured NOT to reproduce the anomaly
-# (the written data matches a fresh connection's). Bound SET targets are therefore
-# out of scope for the marker: the marker claims the column is never a PREDICATE.
-_SET_KEYWORD = re.compile(r"\bSET\b", re.IGNORECASE)
-_SET_CLAUSE_END = re.compile(
-    r"\b(WHERE|FROM|RETURNING|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|VALUES)\b", re.IGNORECASE
-)
-
-
-def _set_clause_spans(stmt: str) -> list[tuple[int, int]]:
-    """Character spans of every ``SET`` target list in *stmt* (exclusive of ``WHERE`` …)."""
-    spans: list[tuple[int, int]] = []
-    for match in _SET_KEYWORD.finditer(stmt):
-        end = _SET_CLAUSE_END.search(stmt, match.end())
-        spans.append((match.end(), end.start() if end else len(stmt)))
-    return spans
-
-
-def _bound_marked_columns(stmt: str, columns: frozenset[str]) -> list[str]:
-    """Marked *columns* bound with ``=`` in PREDICATE position anywhere in *stmt*.
-
-    Both operand orders are covered: ``col = ?`` and ``? = col`` measured to
-    reproduce the anomaly identically. A ``SET`` target is not a predicate, so it is
-    skipped — see the module note on why.
-    """
-    spans = _set_clause_spans(stmt)
-    found: list[str] = []
-    for pattern in (_BOUND_EQUALS, _BOUND_EQUALS_REVERSED):
-        for match in pattern.finditer(stmt):
-            column = match.group(1).lower()
-            if column not in columns:
-                continue
-            if any(start <= match.start() < end for start, end in spans):
-                continue
-            if column not in found:
-                found.append(column)
-    return found
+MARKER = markers.MARKER
+# The DDL/WHERE matchers arm 1 reads live in the sibling with arm 2 (one-way import).
+_dangerous_columns = markers.dangerous_columns
+_is_marked = markers.is_marked
+_where_clauses = markers.where_clauses
 
 # Burn-down list: pre-existing dangerous-shaped sites, keyed by repo-relative
 # path -> hit count at the time this guard landed. Now EMPTY — the six sites the
@@ -168,67 +126,6 @@ _EXCLUDED_PREFIXES = (
     "node_modules/",
     "plugin-catalog/",
 )
-
-_CREATE_INDEX = re.compile(
-    r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?"
-    r"([A-Za-z_]\w*)\s+ON\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*WHERE\s+(.+)$",
-    re.IGNORECASE | re.DOTALL,
-)
-_SQL_COMMENT = re.compile(r"--[^\n]*")
-# ``col = <scalar literal>``, excluding the comparison operators that do NOT
-# reproduce the anomaly (``!=``, ``<=``, ``>=``, ``<>``). A function call or a
-# column on the right-hand side is left alone: neither reproduces it.
-_EQUALS_LITERAL = re.compile(
-    r"(?<![!<>=])\b([A-Za-z_][\w.]*)\s*=\s*('(?:[^']|'')*'|-?\d+(?:\.\d+)?)(?![.\d])"
-)
-# ``col IN (<exactly one literal>)`` — two or more literals measured safe.
-_IN_ONE_LITERAL = re.compile(
-    r"\b([A-Za-z_][\w.]*)\s+IN\s*\(\s*('(?:[^']|'')*'|-?\d+(?:\.\d+)?)\s*\)",
-    re.IGNORECASE,
-)
-
-
-def _is_marked(lines: list[str], lineno: int) -> bool:
-    """True when ``lineno`` (1-based) or the line above carries the opt-out marker."""
-    for idx in (lineno - 1, lineno - 2):
-        if 0 <= idx < len(lines) and MARKER in lines[idx]:
-            return True
-    return False
-
-
-def _where_clauses(sql: str):
-    """Yield ``(index_name, table, where, offset)`` for every partial index in *sql*.
-
-    ``sql`` may be a whole schema script or one implicitly-concatenated Python
-    string; statements are split on ``;`` so a multi-index script reports each
-    index separately. ``offset`` is the character index of the INDEX NAME inside
-    *sql* (not of the enclosing statement), so the caller can report the index's own
-    line rather than the blank line a ``;``-split boundary lands on.
-
-    SQL line comments are BLANKED to spaces (newlines preserved, so offsets stay
-    exact) BEFORE the ``;`` split. Both halves matter: a schema may place an inline
-    ``-- …`` between the index name and ``ON`` (the ``partial-index: ok`` opt-out
-    itself is written that way), and a matcher requiring only whitespace there
-    silently skips the statement — which is how a marked index stops being seen by
-    this arm at all. Blanking first also keeps a ``;`` INSIDE a comment from
-    splitting a statement in half. The marker check reads the RAW file lines, so
-    blanking here does not affect it.
-    """
-    cursor = 0
-    blanked_sql = _SQL_COMMENT.sub(lambda m: " " * len(m.group(0)), sql)
-    for stmt in blanked_sql.split(";"):
-        match = _CREATE_INDEX.search(stmt)
-        if match:
-            name_pos = stmt.find(match.group(1), match.start())
-            yield match.group(1), match.group(2), match.group(4).strip(), cursor + name_pos
-        cursor += len(stmt) + 1
-
-
-def _dangerous_columns(where: str) -> list[tuple[str, str, str]]:
-    """``(column, literal, form)`` for each literal comparison that reproduces it."""
-    found = [(m.group(1), m.group(2), "=") for m in _EQUALS_LITERAL.finditer(where)]
-    found += [(m.group(1), m.group(2), "IN") for m in _IN_ONE_LITERAL.finditer(where)]
-    return found
 
 
 def _python_string_constants(path: Path):
@@ -263,58 +160,6 @@ def _python_string_constants(path: Path):
             )
             constants.append((node.lineno, text))
     return constants, None
-
-
-def _marked_partial_columns(constants: list[tuple[int, str]], lines_by_file: dict[str, list[str]],
-                            relpath: str) -> tuple[frozenset[str], frozenset[str]]:
-    """``(columns, tables)`` the ``partial-index: ok`` markers actually promise about.
-
-    Derived FROM the marked DDL rather than hard-coded, so a new marked partial
-    index (on a new column, a new table) widens what arm 2 enforces automatically —
-    a hard-coded ``("active", "compacted")`` would silently stop covering it. The
-    columns are the ones the marker's honesty claim is about: those the partial
-    ``WHERE`` equates to a scalar literal.
-    """
-    columns: set[str] = set()
-    tables: set[str] = set()
-    lines = lines_by_file.get(relpath, [])
-    for lineno, text in constants:
-        for _name, table, where, offset in _where_clauses(text):
-            stmt_lineno = lineno + text[:offset].count("\n")
-            if not _is_marked(lines, stmt_lineno):
-                continue
-            tables.add(table.lower())
-            columns.update(column.lower() for column, _literal, _form in _dangerous_columns(where))
-    return frozenset(columns), frozenset(tables)
-
-
-def _scan_query_side(relpath: str, constants: list[tuple[int, str]], columns: frozenset[str],
-                     tables: frozenset[str]) -> list[str]:
-    """``path:line: ...`` for each production bind that makes a marker false.
-
-    Only statements that reference a MARKED index's table are candidates: a bind of
-    the same column name on some other table cannot be served by that partial index,
-    so flagging it would be a false positive the marker never claimed.
-    """
-    sites: list[str] = []
-    for lineno, text in constants:
-        if not any(table in text.lower() for table in tables):
-            continue
-        for stmt in text.split(";"):
-            if not any(re.search(rf"\b{table}\b", stmt, re.IGNORECASE) for table in tables):
-                continue
-            bound = _bound_marked_columns(stmt, columns)
-            if not bound:
-                continue
-            flat = " ".join(stmt.split())
-            for column in bound:
-                sites.append(
-                    f"{relpath}:{lineno}: `{column} = ?` in a production statement — a kept-partial"
-                    f" index whose `{MARKER}` marker claims `{column}` is never bound with `=`"
-                    f" (a reused parameterized statement bound to a different value then returns"
-                    f" WRONG rows). Statement: {flat[:160]}"
-                )
-    return sites
 
 
 def _tracked_python_files(root: Path) -> list[str]:
@@ -376,31 +221,19 @@ def _scan_file(root: Path, relpath: str) -> tuple[list[str], list[tuple[int, str
                     "parameterized statement bound to a different value returns WRONG "
                     "rows on this fleet's SQLite (see the guard's docstring)"
                 )
-    columns, tables = _marked_partial_columns(ddl_constants, {relpath: lines}, relpath)
+    columns, tables = markers.marked_partial_columns(ddl_constants, {relpath: lines}, relpath)
     return ddl_sites, constants, columns, tables, []
 
 
-def _print_baseline(counts: dict[str, int]) -> None:
-    body = "".join(f'    "{path}": {count},\n' for path, count in sorted(counts.items()))
-    print("_BASELINE: dict[str, int] = {\n" + body + "}")
+def _scan_tree(root: Path) -> tuple[dict[str, list[str]], list[tuple[str, int, str]],
+                                    frozenset[str], frozenset[str], list[str]]:
+    """Walk the tracked tree: ``(ddl_per_file, bind_candidates, columns, tables, errors)``.
 
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument("root", nargs="?", default=".", help="git checkout to scan")
-    parser.add_argument("--all", action="store_true",
-                        help="ignore _BASELINE; report every dangerous site")
-    parser.add_argument("--print-baseline", action="store_true",
-                        help="print a _BASELINE literal matching the current tree")
-    parser.add_argument("--strict-baseline", action="store_true",
-                        help="fail on stale/overstated _BASELINE entries too")
-    args = parser.parse_args(argv)
-
-    root = Path(args.root).resolve()
-    if not root.is_dir():
-        print(f"no such directory: {root}", file=sys.stderr)
-        return 2
-
+    The marked columns/tables are unioned across every file, because arm 2's claim is
+    enforced TREE-WIDE: the marker lives in the schema module while the statement that
+    would falsify it can be in any file. ``bind_candidates`` keeps only the constants
+    that bind some column with ``=`` — the cheap pre-filter for the (rarer) marked ones.
+    """
     ddl_per_file: dict[str, list[str]] = {}
     bind_candidates: list[tuple[str, int, str]] = []
     marked_columns: set[str] = set()
@@ -413,36 +246,26 @@ def main(argv: list[str] | None = None) -> int:
             ddl_per_file[relpath] = ddl_sites
         marked_columns.update(columns)
         marked_tables.update(tables)
-        for lineno, text in constants:
-            if _BOUND_EQUALS.search(text) or _BOUND_EQUALS_REVERSED.search(text):
-                bind_candidates.append((relpath, lineno, text))
-
-    if errors:
-        for err in errors:
-            print(f"inventory error: {err}", file=sys.stderr)
-        print(
-            f"{len(errors)} tracked file(s) could not be analyzed — failing the check "
-            "rather than scanning a partial inventory",
-            file=sys.stderr,
+        bind_candidates.extend(
+            (relpath, lineno, text) for lineno, text in markers.bind_candidates(constants)
         )
-        return 2
+    return ddl_per_file, bind_candidates, frozenset(marked_columns), frozenset(marked_tables), errors
 
-    # Arm 2. The marked columns/tables come from the marked DDL, so the set is
-    # never hard-coded; a tree with no markers enforces nothing (and says so).
-    frozen_columns = frozenset(marked_columns)
-    frozen_tables = frozenset(marked_tables)
+
+def _bind_per_file(bind_candidates: list[tuple[str, int, str]], columns: frozenset[str],
+                   tables: frozenset[str]) -> dict[str, list[str]]:
+    """Arm 2's findings, grouped by file, for the candidates :func:`_scan_tree` kept."""
     bind_per_file: dict[str, list[str]] = {}
     for relpath, lineno, text in bind_candidates:
-        sites = _scan_query_side(relpath, [(lineno, text)], frozen_columns, frozen_tables)
+        sites = markers.scan_query_side(relpath, [(lineno, text)], columns, tables)
         if sites:
             bind_per_file.setdefault(relpath, []).extend(sites)
+    return bind_per_file
 
-    counts = {path: len(sites) for path, sites in ddl_per_file.items()}
-    if args.print_baseline:
-        _print_baseline(counts)
-        return 0
 
-    baseline = {} if args.all else _BASELINE
+def _baseline_findings(ddl_per_file: dict[str, list[str]], counts: dict[str, int],
+                       baseline: dict[str, int]) -> tuple[list[str], list[str]]:
+    """``(offenders, advisories)`` for arm 1 against the burn-down *baseline*."""
     offenders: list[str] = []
     advisories: list[str] = []
     for path, sites in sorted(ddl_per_file.items()):
@@ -454,16 +277,25 @@ def main(argv: list[str] | None = None) -> int:
             advisories.append(
                 f"{path}: {counts.get(path, 0)} dangerous site(s) left, _BASELINE says {allowed}"
             )
+    return offenders, advisories
 
+
+def _print_baseline(counts: dict[str, int]) -> None:
+    body = "".join(f'    "{path}": {count},\n' for path, count in sorted(counts.items()))
+    print("_BASELINE: dict[str, int] = {\n" + body + "}")
+
+
+def _emit(offenders: list[str], bind_offenders: list[str], advisories: list[str],
+          frozen_columns: frozenset[str]) -> None:
+    """Print both arms' findings and the repo-specific remedy for each."""
+    for note in advisories:
+        print(f"advisory — {note}", file=sys.stderr)
     if advisories:
-        for note in advisories:
-            print(f"advisory — {note}", file=sys.stderr)
         print(
             "advisory — _BASELINE in scripts/ci/check_partial_index_where.py is stale; "
             "regenerate it with --print-baseline",
             file=sys.stderr,
         )
-
     if not frozen_columns:
         print(
             f"advisory — no `{MARKER}` marker found in tracked production *.py, so the "
@@ -471,8 +303,6 @@ def main(argv: list[str] | None = None) -> int:
             "deliberately, drop this line's expectation",
             file=sys.stderr,
         )
-
-    bind_offenders = [site for sites in bind_per_file.values() for site in sites]
     if offenders:
         for site in offenders:
             print(site)
@@ -492,6 +322,50 @@ def main(argv: list[str] | None = None) -> int:
             "marker that statement falsifies.",
             file=sys.stderr,
         )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
+    parser.add_argument("root", nargs="?", default=".", help="git checkout to scan")
+    parser.add_argument("--all", action="store_true",
+                        help="ignore _BASELINE; report every dangerous site")
+    parser.add_argument("--print-baseline", action="store_true",
+                        help="print a _BASELINE literal matching the current tree")
+    parser.add_argument("--strict-baseline", action="store_true",
+                        help="fail on stale/overstated _BASELINE entries too")
+    args = parser.parse_args(argv)
+
+    root = Path(args.root).resolve()
+    if not root.is_dir():
+        print(f"no such directory: {root}", file=sys.stderr)
+        return 2
+
+    ddl_per_file, bind_candidates, frozen_columns, frozen_tables, errors = _scan_tree(root)
+    if errors:
+        for err in errors:
+            print(f"inventory error: {err}", file=sys.stderr)
+        print(
+            f"{len(errors)} tracked file(s) could not be analyzed — failing the check "
+            "rather than scanning a partial inventory",
+            file=sys.stderr,
+        )
+        return 2
+
+    # Arm 2. The marked columns/tables come from the marked DDL, so the set is
+    # never hard-coded; a tree with no markers enforces nothing (and says so).
+    counts = {path: len(sites) for path, sites in ddl_per_file.items()}
+    if args.print_baseline:
+        _print_baseline(counts)
+        return 0
+
+    offenders, advisories = _baseline_findings(
+        ddl_per_file, counts, {} if args.all else _BASELINE
+    )
+    bind_offenders = [
+        site for sites in _bind_per_file(bind_candidates, frozen_columns, frozen_tables).values()
+        for site in sites
+    ]
+    _emit(offenders, bind_offenders, advisories, frozen_columns)
     if offenders or bind_offenders:
         return 1
     if advisories and args.strict_baseline:
