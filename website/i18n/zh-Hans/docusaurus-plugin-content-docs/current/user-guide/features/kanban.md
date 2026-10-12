@@ -589,8 +589,9 @@ hermes kanban notify-unsubscribe <id>
 hermes kanban context <id>                             # worker 看到的内容
 hermes kanban specify [<id> | --all] [--tenant T]      # 将分诊列的想法充实
         [--author NAME] [--json]                       #   为完整规格并推进到 todo
-hermes kanban gc [--event-retention-days N]            # 工作区 + 旧事件 + 旧日志
+hermes kanban gc [--event-retention-days N]            # 工作区 + 旧事件 + 旧日志 + 旧运行记录
         [--log-retention-days N]
+        [--run-retention-days N]                       #   运行记录默认 0 = 禁用
 ```
 
 所有命令也可以作为交互式 CLI 中的斜杠命令和消息 gateway 中使用（见下方[`/kanban` 斜杠命令](#kanban-slash-command)）。
