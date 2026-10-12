@@ -53,11 +53,17 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def _dead_worker_with_log(conn, tid: str, pid: int, rc: int,
-                          provider: str | None = None, model: str | None = None) -> None:
+                          provider: str | None = None, model: str | None = None,
+                          *, session_start: int | None = None) -> None:
     """Claim ``tid`` for a worker that already exited ``rc`` and wrote its own log.
 
     ``provider``/``model`` are what the worker's trailer reports as the route that
     served the run; omit both for the legacy (pre-attribution) trailer shape.
+
+    ``session_start`` is the epoch the exit summary names as the session's own start —
+    production always writes it (the CLI prints ``hermes --resume <id>`` above the
+    trailer), and the unreaped path's window check reads it. Defaults to the run's own
+    start, which is what a worker that ran normally records.
     """
     host = kb._claimer_id().split(":", 1)[0]
     kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
@@ -66,10 +72,13 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int,
         (pid, int(time.time()) - 120, tid),
     )
     conn.commit()
+    stamp = int(time.time()) if session_start is None else session_start
     log = kb.worker_log_path(tid)
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"the model said something\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}"
+        f.write("the model said something\n\nResume this session with:\n"
+                f"  hermes --resume {time.strftime('%Y%m%d_%H%M%S', time.localtime(stamp))}_abc123\n\n"
+                f"{KANBAN_WORKER_EXIT_TRAILER}{rc}"
                 f"{kpd.trailer_fields(provider, model)}\n")
 
 
@@ -218,6 +227,82 @@ def test_a_stale_log_tail_from_a_later_run_is_not_charged_to_its_route(kanban_ho
         assert meta["model"] is None
         assert "wall_count" not in meta
         assert kpd.walled_routes() == set()
+
+
+def test_an_unreaped_stale_tail_is_not_charged_to_a_later_run(kanban_home):
+    """The unreaped path has no observed rc, so the SESSION STAMP witnesses the route.
+
+    ``_classify_dead_worker_exit`` passes ``observed_code=code``, and ``code`` is ``None``
+    whenever the pid is not in this process's reap registry — the per-tick dispatcher path.
+    The log is append-mode across re-runs, so the tail trailer can be a DIFFERENT run's, and
+    with no rc to match against the legacy read charges the wall to whatever route that other
+    run happened to use. Measured on the live board, 3 production ``rate_limited`` rows did
+    exactly that (e.g. run 2699 of t_2553a507: this run started 18:58:24 and left no trailer,
+    while the tail held an 18:52:24 session's ``opencode-go`` trailer — an EARLIER run).
+
+    The trailer's own session start falls inside ``[run.started_at, now]`` for the run that
+    wrote it, so a trailer stamped before the run began has its ROUTE withheld: the wall stays
+    unnamed and demotes nothing rather than being charged to a route that never served it.
+    The rc is deliberately still honoured — on this path the tail trailer is the only witness
+    of how the worker exited, and blanking it would flip a quota wall into a failure-counting
+    ``crashed``. Contrast ``test_a_stale_log_tail_from_a_later_run_is_not_charged_to_its_route``,
+    which pins the same route property on the REAPED path via the observed rc.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        # An EARLIER run's summary + trailer (this run left none of its own).
+        earlier = int(time.time()) - 3600
+        _dead_worker_with_log(conn, tid, 80041, kb.KANBAN_RATE_LIMIT_EXIT_CODE, *PRIMARY,
+                              session_start=earlier)
+        # This run began AFTER that earlier session started.
+        conn.execute("UPDATE tasks SET started_at=? WHERE id=?", (int(time.time()) - 120, tid))
+        conn.commit()
+        # Never reaped here: the reap registry has no entry, so there is no observed rc.
+        kbd._recent_worker_exits.clear()
+
+        kbd.detect_crashed_workers(conn)
+
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        meta = kb._json_dict(run["metadata"])
+        # Still a quota wall, not a counted crash — the rc witness is untouched.
+        assert run["outcome"] == "rate_limited"
+        assert kb.get_task(conn, tid).consecutive_failures == 0
+        # …but an earlier run's route is NOT charged to it.
+        assert meta["provider"] is None, "an earlier run's route was charged to this wall"
+        assert meta["model"] is None
+        assert "wall_count" not in meta
+        assert kpd.walled_routes() == set()
+
+
+def test_an_unreaped_own_tail_still_names_its_route(kanban_home):
+    """The positive control: the window must not withhold the run's OWN route.
+
+    Without this, the stale-tail pin above is satisfied by a rule that withholds every
+    route on the unreaped path — which would close the stale class by silently
+    reopening the null-provider hole this lane exists to close.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        _dead_worker_with_log(conn, tid, 80042, kb.KANBAN_RATE_LIMIT_EXIT_CODE, *PRIMARY)
+        conn.execute("UPDATE tasks SET started_at=? WHERE id=?", (int(time.time()) - 120, tid))
+        conn.commit()
+        kbd._recent_worker_exits.clear()
+
+        kbd.detect_crashed_workers(conn)
+
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        meta = kb._json_dict(run["metadata"])
+        assert run["outcome"] == "rate_limited"
+        assert meta["provider"] == PRIMARY[0], "the run's own route was withheld"
+        assert meta["model"] == PRIMARY[1]
+        assert meta["wall_count"] == 1
+        # The route reaches the shared tally (one wall is below the 2-wall demotion
+        # threshold, so read the count rather than ``walled_routes()``).
+        assert kpd._wall_counts().get(PRIMARY, 0) >= 1
 
 
 def test_legacy_worker_without_provider_still_classifies(kanban_home):

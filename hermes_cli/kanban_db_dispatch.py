@@ -49,10 +49,6 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
-# Worker log files larger than this at spawn time are rotated.
-DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
-DEFAULT_LOG_BACKUP_COUNT = 1
-
 # Keep a little wall-clock budget for the worker to observe a terminal timeout
 # and make a terminal board call (kanban_block/kanban_complete/kanban_request_review)
 # before max_runtime_seconds kills it.
@@ -271,19 +267,25 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
     return ("nonzero_exit", code)
 
 
-# The worker-log readers (exit trailer, last printed output) live in the topical
-# sibling ``kanban_db_workerlog``; re-exported here so existing ``kbd.<name>``
-# callers and tests keep working. Moved out to offset this file's FILE_LINES
-# growth when the provider-attribution fix landed (see ``scripts/check --only
-# health``: the file may only go down).
+# The worker-log readers (exit trailer, last printed output) and the log file's
+# rotation live in the topical sibling ``kanban_db_workerlog``; re-exported here
+# so existing ``kbd.<name>`` callers and tests keep working. Moved out to offset
+# this file's FILE_LINES growth (see ``scripts/check --only health``: the file may
+# only go down).
 from hermes_cli.kanban_db_workerlog import (
+    DEFAULT_LOG_BACKUP_COUNT,
+    DEFAULT_LOG_ROTATE_BYTES,
     _EXIT_TRAILER_RE,
     _exit_summary_marker,
     _LOG_CHROME,
     _log_noise_prefixes,
+    _positive_int,
+    _rotate_worker_log,
+    _rotated_log_path,
     _worker_final_output,
     _worker_log_exit_code,
     _worker_log_exit_trailer,
+    worker_log_rotation_config,
 )
 
 
@@ -1025,6 +1027,7 @@ class _DeadWorker:
 
 def _classify_dead_worker(
     pid: int, claimer: Optional[str], *, task_id: Optional[str] = None, board: Optional[str] = None,
+    run_started_at: Optional[int] = None,
 ) -> _DeadWorker:
     """Map a dead worker's reaped exit status to its reclaim bookkeeping.
 
@@ -1032,7 +1035,8 @@ def _classify_dead_worker(
     in the event payload, appended to the error text) so the board and the retry
     worker see WHY instead of a bare label; a rate-limited requeue does not need it.
     """
-    dead = _classify_dead_worker_exit(pid, claimer, task_id=task_id, board=board)
+    dead = _classify_dead_worker_exit(
+        pid, claimer, task_id=task_id, board=board, run_started_at=run_started_at)
     if task_id and not dead.rate_limited:
         worker_output = _worker_final_output(task_id, board=board)
         if worker_output:
@@ -1047,6 +1051,7 @@ def _classify_dead_worker_exit(
     *,
     task_id: Optional[str] = None,
     board: Optional[str] = None,
+    run_started_at: Optional[int] = None,
 ) -> _DeadWorker:
     """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
 
@@ -1067,7 +1072,8 @@ def _classify_dead_worker_exit(
     gateway-reaped ``rate_limited`` rows carried a null provider. Reading it
     unconditionally is what makes a wall attributable; the route is still only
     recorded when the worker actually named one, so an unnamed wall keeps
-    demoting nothing.
+    demoting nothing. ``run_started_at`` (the active run's stamp) is the rc-free
+    witness the unreaped path needs — see ``_worker_log_exit_trailer``.
     """
     kind, code = _classify_worker_exit(pid)
     trailer_provider = trailer_model = None
@@ -1076,7 +1082,7 @@ def _classify_dead_worker_exit(
         # log tail may belong to a LATER run of the same task (append-mode log),
         # so the trailer is only trusted when its rc matches what we observed.
         logged, trailer_provider, trailer_model = _worker_log_exit_trailer(
-            task_id, board=board, observed_code=code)
+            task_id, board=board, observed_code=code, run_started_at=run_started_at)
         if kind == "unknown" and logged is not None:
             kind, code = _exit_code_kind(logged)
     if kind == "clean_exit":
@@ -1157,9 +1163,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
+            # The active run's own ``started_at`` bounds its trailer; ``tasks.started_at``
+            # is the FIRST claim's stamp and predates a retried attempt.
+            "SELECT t.id, t.worker_pid, t.worker_started_at, t.claim_lock, t.started_at, t.assignee, "
+            "       COALESCE(r.started_at, t.started_at) AS run_started_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+            "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
@@ -1175,7 +1184,10 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
 
             pid = int(row["worker_pid"])
-            dead = _classify_dead_worker(pid, row["claim_lock"], task_id=row["id"], board=board)
+            dead = _classify_dead_worker(
+                pid, row["claim_lock"], task_id=row["id"], board=board,
+                run_started_at=_kb._row_get(row, "run_started_at"),
+            )
             retry_status = _kb._retry_status_for_run(conn, row["id"])
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
@@ -2441,66 +2453,6 @@ def _dispatch_once_locked(
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
             spawned += 1
     return result
-
-
-def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return parsed if parsed >= minimum else default
-
-
-def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, int]:
-    """Return ``(rotate_bytes, backup_count)`` for worker log rotation.
-    Defaults: rotate at 2 MiB, keep one backup (``.log.1``); both overridable
-    from ``config.yaml``.
-    """
-    if kanban_cfg is None:
-        try:
-            from hermes_cli.config import load_config
-
-            kanban_cfg = (load_config().get("kanban") or {})
-        except Exception:
-            kanban_cfg = {}
-    kanban_cfg = kanban_cfg or {}
-    max_bytes = _positive_int(kanban_cfg.get("worker_log_rotate_bytes"), DEFAULT_LOG_ROTATE_BYTES, minimum=1)
-    backup_count = _positive_int(kanban_cfg.get("worker_log_backup_count"), DEFAULT_LOG_BACKUP_COUNT, minimum=0)
-    return max_bytes, backup_count
-
-
-def _rotated_log_path(log_path: Path, generation: int) -> Path:
-    return log_path.with_suffix(log_path.suffix + f".{generation}")
-
-
-def _rotate_worker_log(
-    log_path: Path,
-    max_bytes: int,
-    backup_count: int = DEFAULT_LOG_BACKUP_COUNT,
-) -> None:
-    """Rotate ``<log>`` when it exceeds ``max_bytes``: ``<log>`` → ``<log>.1``,
-    older generations shift up to ``backup_count``.
-    """
-    try:
-        if not log_path.exists() or log_path.stat().st_size <= max_bytes:
-            return
-        backup_count = _positive_int(backup_count, DEFAULT_LOG_BACKUP_COUNT, minimum=0)
-        if backup_count == 0:
-            log_path.unlink()
-            return
-        oldest = _rotated_log_path(log_path, backup_count)
-        with contextlib.suppress(OSError):
-            if oldest.exists():
-                oldest.unlink()
-        for generation in range(backup_count - 1, 0, -1):
-            src = _rotated_log_path(log_path, generation)
-            if not src.exists():
-                continue
-            with contextlib.suppress(OSError):
-                src.rename(_rotated_log_path(log_path, generation + 1))
-        log_path.rename(_rotated_log_path(log_path, 1))
-    except OSError:
-        pass
 
 
 def _module_hermes_argv() -> list[str]:

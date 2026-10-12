@@ -33,8 +33,14 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return home
 
 
-def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
-    """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here."""
+def _dead_worker_with_log(conn, tid: str, pid: int, rc: int, *,
+                          session_start: int | None = None) -> None:
+    """Claim ``tid`` for a worker that already exited ``rc`` and wrote its log — never reaped here.
+
+    ``session_start`` is the epoch the exit summary names as the session's own start;
+    production always writes it (the CLI prints ``hermes --resume <id>`` above the
+    trailer) and the unreaped path's window check reads it.
+    """
     host = kb._claimer_id().split(":", 1)[0]
     kb.claim_task(conn, tid, claimer=f"{host}:w{pid}")
     conn.execute(
@@ -42,10 +48,13 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
         (pid, int(time.time()) - 120, tid),
     )
     conn.commit()
+    stamp = int(time.time()) if session_start is None else session_start
     log = kb.worker_log_path(tid)
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "a", encoding="utf-8") as f:
-        f.write(f"the model said something\n\nResume this session with:\n  hermes --resume x\n\n{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
+        f.write("the model said something\n\nResume this session with:\n"
+                f"  hermes --resume {time.strftime('%Y%m%d_%H%M%S', time.localtime(stamp))}_abc123\n\n"
+                f"{KANBAN_WORKER_EXIT_TRAILER}{rc}\n")
 
 
 @pytest.mark.parametrize(
