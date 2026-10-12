@@ -101,6 +101,10 @@ class BoardRequest:
             raise RpcError("malformed_frame", "frame must be a JSON object")
 
         version = frame.get("version")
+        # Exact type check: ``True == 1`` and ``1.0 == 1`` in Python, so an
+        # equality test would accept a bool or float as a protocol version.
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise RpcError("malformed_frame", "'version' must be an integer")
         if version != PROTOCOL_VERSION:
             raise RpcError(
                 "unsupported_version",
@@ -226,40 +230,80 @@ def _store_receipt(conn: sqlite3.Connection, req: BoardRequest,
 # Authorization — verified inside the mutation's transaction
 # --------------------------------------------------------------------------
 
-def verify_run_authority(conn: sqlite3.Connection, req: BoardRequest) -> None:
-    """Assert the actor task is still running THIS run, inside the caller's txn.
-
-    Deliberately re-checked under the write lock rather than trusted from
-    connection setup: between authenticating the connection and taking the write
-    transaction, the card can be reclaimed and a second run started.
-
-    NOTE: this is an *authorization* check. It is not authentication — the
-    identity triple (task, run, claim lock) is a concurrency coordinate, not a
-    credential. Authentication is the capability check performed by the caller
-    before dispatching here.
-    """
+def _authority_row(conn: sqlite3.Connection, req: BoardRequest) -> sqlite3.Row:
+    """Fetch the task + run rows that decide authority."""
     row = conn.execute(
-        "SELECT status, current_run_id FROM tasks WHERE id = ?", (req.actor_task_id,)
+        "SELECT t.status AS task_status, t.current_run_id, t.claim_lock AS task_claim_lock, "
+        "       t.claim_expires AS task_claim_expires, t.last_heartbeat_at, "
+        "       r.id AS run_id, r.task_id AS run_task_id, r.status AS run_status, "
+        "       r.claim_lock AS run_claim_lock, r.claim_expires AS run_claim_expires, "
+        "       r.ended_at AS run_ended_at "
+        "  FROM tasks t LEFT JOIN task_runs r ON r.id = ? "
+        " WHERE t.id = ?",
+        (req.run_id, req.actor_task_id),
     ).fetchone()
     if row is None:
         raise RpcError("unknown_actor_task", f"actor task {req.actor_task_id!r} does not exist")
-    if row["status"] != "running":
-        raise RpcError(
-            "actor_not_running",
-            f"actor task {req.actor_task_id!r} is {row['status']!r}, not 'running'",
-        )
+    return row
+
+
+def authority_problems(conn: sqlite3.Connection, req: BoardRequest,
+                       *, now: Optional[int] = None) -> list[str]:
+    """Every reason this request currently lacks mutation authority, in order.
+
+    Deliberately reports the FULL list rather than the first failure: an operator
+    debugging a rejected remote worker needs to see all of it, and the checks are
+    cheap and already loaded.
+
+    Mirrors the ``worker_claim_is_live`` contract: an expired lease means mutation
+    authority has lapsed *even before the reaper processes the row*, and a closed
+    run is not authority either. Reporting an expired or nonexistent run as live
+    is worse than reporting nothing, because a caller acts on it.
+    """
+    ts = int(now if now is not None else time.time())
+    row = _authority_row(conn, req)
+    problems: list[str] = []
+
+    if row["task_status"] != "running":
+        problems.append(f"task is {row['task_status']!r}, not 'running'")
     if row["current_run_id"] != req.run_id:
-        raise RpcError(
-            "stale_run",
-            f"run {req.run_id} is not the live run of {req.actor_task_id!r}",
-        )
-    run = conn.execute(
-        "SELECT task_id, status FROM task_runs WHERE id = ?", (req.run_id,)
-    ).fetchone()
-    if run is None:
-        raise RpcError("unknown_run", f"run {req.run_id} does not exist")
-    if run["task_id"] != req.actor_task_id:
-        raise RpcError("run_task_mismatch", f"run {req.run_id} does not belong to the actor task")
+        problems.append(f"run {req.run_id} is not the live run (current_run_id={row['current_run_id']})")
+
+    # -- run row ----------------------------------------------------------
+    if row["run_id"] is None:
+        problems.append(f"run {req.run_id} does not exist")
+        return problems
+    if row["run_task_id"] != req.actor_task_id:
+        problems.append(f"run {req.run_id} belongs to {row['run_task_id']!r}, not the actor task")
+    if row["run_status"] != "running":
+        problems.append(f"run status is {row['run_status']!r}, not 'running'")
+    if row["run_ended_at"] is not None:
+        problems.append(f"run was closed at {row['run_ended_at']}")
+
+    # -- leases (both rows must be unexpired) ------------------------------
+    for label, expires in (("task", row["task_claim_expires"]),
+                           ("run", row["run_claim_expires"])):
+        if expires is None:
+            problems.append(f"{label} has no claim lease (claim_expires is NULL)")
+        elif int(expires) <= ts:
+            problems.append(f"{label} claim lease expired at {expires} (now {ts})")
+
+    return problems
+
+
+def verify_run_authority(conn: sqlite3.Connection, req: BoardRequest) -> None:
+    """Raise unless the actor task currently holds live authority for THIS run.
+
+    Re-checked under the caller's write lock rather than trusted from connection
+    setup: between authenticating the connection and taking the write
+    transaction, the card can be reclaimed and a second run started.
+
+    NOTE: this is *authorization*. It is not authentication — the identity triple
+    (task, run, claim lock) is a concurrency coordinate, not a credential.
+    """
+    problems = authority_problems(conn, req)
+    if problems:
+        raise RpcError("no_authority", "; ".join(problems))
 
 
 # --------------------------------------------------------------------------
@@ -269,49 +313,51 @@ def verify_run_authority(conn: sqlite3.Connection, req: BoardRequest) -> None:
 def _op_claim_status(conn: sqlite3.Connection, req: BoardRequest) -> dict[str, Any]:
     """Read-only: report the authoritative claim state for the actor run.
 
-    This replaces the remote branch of ``worker_claim_is_live()``, which reads
-    the board directly and therefore cannot work off-owner.
+    This replaces the remote branch of ``worker_claim_is_live()``, which reads the
+    board directly and therefore cannot work off-owner.
+
+    ``is_live`` is derived from the SAME predicate that authorizes mutation, so it
+    can never report a run as live that the mutation path would then reject. An
+    expired lease or a closed run is reported NOT live, with the reasons attached —
+    a caller acts on this answer, so a false positive is worse than no answer.
     """
-    row = conn.execute(
-        "SELECT t.status, t.current_run_id, t.claim_lock, t.last_heartbeat_at, "
-        "       r.status AS run_status, r.claim_lock AS run_claim_lock "
-        "  FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        " WHERE t.id = ?",
-        (req.actor_task_id,),
-    ).fetchone()
-    if row is None:
-        raise RpcError("unknown_actor_task", f"actor task {req.actor_task_id!r} does not exist")
-    live = (row["status"] == "running" and row["current_run_id"] == req.run_id)
+    row = _authority_row(conn, req)
+    problems = authority_problems(conn, req)
     return {
         "actor_task_id": req.actor_task_id,
         "run_id": req.run_id,
-        "task_status": row["status"],
+        "task_status": row["task_status"],
         "current_run_id": row["current_run_id"],
         "run_status": row["run_status"],
-        "claim_lock": row["claim_lock"],
+        "run_ended_at": row["run_ended_at"],
+        "task_claim_expires": row["task_claim_expires"],
+        "run_claim_expires": row["run_claim_expires"],
         "last_heartbeat_at": row["last_heartbeat_at"],
-        "is_live": live,
+        "is_live": not problems,
+        "problems": problems,
     }
 
 
-def _op_comment(conn: sqlite3.Connection, req: BoardRequest) -> dict[str, Any]:
+def _op_comment(conn: sqlite3.Connection, req: BoardRequest, *,
+                author: str) -> dict[str, Any]:
     """Mutating: append a comment to ``target_task_id`` (default: the actor task).
 
-    Author is taken from the authenticated grant — never from the payload, which
-    the model controls.
+    The author is a REQUIRED parameter sourced from the authenticated grant, never
+    read from the payload — the model controls the payload.
+
+    Writes through ``insert_comment_txn``, which fires no observer. The caller
+    fires the lifecycle hook after its commit; firing here would let an external
+    effect escape a transaction that may still roll back.
     """
     body = req.payload.get("body")
     if not isinstance(body, str) or not body.strip():
         raise RpcError("invalid_payload", "'body' must be a non-empty string")
     target = req.target_task_id or req.actor_task_id
-    author = req.payload.get("_author")  # injected from the grant, never from the wire
-    if not isinstance(author, str) or not author:
-        raise RpcError("no_author", "authenticated author is missing")
-    comment_id = kb.add_comment(conn, target, author, body)
+    comment_id = kb.insert_comment_txn(conn, target, author, body)
     return {"comment_id": comment_id, "target_task_id": target, "author": author}
 
 
-_OPERATIONS: dict[str, Callable[[sqlite3.Connection, BoardRequest], dict[str, Any]]] = {
+_OPERATIONS: dict[str, Callable[..., dict[str, Any]]] = {
     OP_CLAIM_STATUS: _op_claim_status,
     OP_COMMENT: _op_comment,
 }
@@ -325,17 +371,22 @@ def execute_request(req: BoardRequest, *, conn: Optional[sqlite3.Connection] = N
                     author: Optional[str] = None) -> dict[str, Any]:
     """Execute one authenticated request against the local board.
 
-    ``author`` comes from the connection's authenticated grant and is injected
-    into the payload so operation implementations never read an author the model
-    supplied. It ALWAYS overrides any ``_author`` already present: the payload is
-    model-controlled, so a caller-supplied author must never win.
-    """
-    if author:
-        object.__setattr__(req, "payload", {**req.payload, "_author": author})
+    ``author`` MUST come from the connection's authenticated grant. It is passed
+    to operations as a separate argument — never injected into the payload — so a
+    model-supplied ``_author`` cannot influence it, and the request object stays
+    immutable so ``request_hash()`` keeps describing what the caller actually sent.
 
+    An absent ``author`` is a refusal, not a fallback: this method is only ever
+    reached from an authenticated channel, so no author means the channel did not
+    establish one.
+    """
     handler = _OPERATIONS.get(req.operation)
     if handler is None:
         raise RpcError("unsupported_operation", f"operation {req.operation!r} is not supported")
+
+    if req.operation in MUTATING_OPERATIONS and not (author or "").strip():
+        raise RpcError("no_authenticated_author",
+                       "a mutating operation requires an authenticated author")
 
     own_conn = conn is None
     if own_conn:
@@ -354,12 +405,36 @@ def execute_request(req: BoardRequest, *, conn: Optional[sqlite3.Connection] = N
             if cached is not None:
                 return cached.result
             verify_run_authority(conn, req)
-            result = handler(conn, req)
+            result = handler(conn, req, author=author)
             _store_receipt(conn, req, result)
-            return result
+        # ONLY now — after the commit — may an observer run. Firing inside the
+        # transaction would let an external effect escape a rollback, and an
+        # observer on another connection could not yet see the row.
+        _fire_post_commit_obligations(conn, req, result)
+        return result
     finally:
         if own_conn:
             conn.close()
+
+
+def _fire_post_commit_obligations(conn: sqlite3.Connection, req: BoardRequest,
+                                  result: dict[str, Any]) -> None:
+    """Run the lifecycle observers a committed operation owes.
+
+    NOTE: this is deliberately the SIMPLE form for now. If the process dies
+    between the commit and this call, the observer never fires and the comment
+    notification is lost — see the recoverable outbox in the design spec. Kept
+    separate and named so that swap is local.
+    """
+    if req.operation == OP_COMMENT:
+        try:
+            kb._fire_task_hook_by_id(
+                conn, "kanban_task_commented", result["target_task_id"],
+                author=result["author"], body=req.payload.get("body"),
+                comment_id=result["comment_id"],
+            )
+        except Exception as exc:
+            _log.warning("kanban rpc: post-commit comment hook failed: %s", exc)
 
 
 def new_request_id() -> str:

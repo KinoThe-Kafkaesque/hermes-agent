@@ -170,6 +170,28 @@ def _fire_task_hook(event: str, task: Optional[Task], task_id: str, run_id: Opti
     )
 
 
+def _fire_task_hook_by_id(
+    conn: sqlite3.Connection, event: str, task_id: str, *,
+    run_id: Optional[int] = None, **fields: Any,
+) -> None:
+    """``_fire_task_hook`` for callers that hold only an id (e.g. comments).
+
+    Reads ``assignee`` through the caller's connection so observers see the same
+    field the transition hooks carry, then fires the hook directly — building a
+    partial ``Task`` for ``_fire_task_hook`` would need every required dataclass
+    field. ``run_id`` is supplied here (the caller knows which attempt it is);
+    ``fields`` must NOT contain ``assignee``/``board``/``run_id``.
+    """
+    try:
+        row = conn.execute("SELECT assignee FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    except Exception:  # pragma: no cover - defensive  # health: allow BLE001 -- a failed assignee read must not skip the lifecycle hook
+        row = None
+    _fire_kanban_lifecycle_hook(
+        event, task_id, board=get_current_board(),
+        assignee=row[0] if row else None, run_id=run_id, **fields,
+    )
+
+
 def _hook_profile_name() -> str:
     """Active profile for hook payloads; ``"default"`` when it cannot be resolved."""
     from hermes_cli.profiles import get_active_profile_name
@@ -1750,22 +1772,49 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
+def insert_comment_txn(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
+    """Write a comment + its ``commented`` event. **Transaction-owned: fires NO observer.**
+
+    The caller owns the transaction, so the lifecycle hook must be fired by the
+    caller *after* its commit. Firing inside an outer transaction is a defect:
+    an observer reading through another connection cannot see the row yet, and a
+    later rollback leaves the external effect already delivered — see the
+    post-commit contract on ``_fire_kanban_lifecycle_hook``.
+
+    Returns the new comment id.
+    """
+    if not body or not body.strip():
+        raise ValueError("comment body is required")
+    if not author or not author.strip():
+        raise ValueError("comment author is required")
+    _require_task(conn, task_id)
+    cur = conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, author.strip(), body.strip(), int(time.time())),
+    )
+    _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+    return int(cur.lastrowid or 0)
+
+
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    now = int(time.time())
     # ``allow_nested=True``: graph builders (kanban_swarm blackboard seeding)
     # compose comment writes under one outer commit.
     with write_txn(conn, allow_nested=True):
-        _require_task(conn, task_id)
-        cur = conn.execute(
-            "INSERT INTO task_comments (task_id, author, body, created_at) "
-            "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
-        )
-        _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = insert_comment_txn(conn, task_id, author, body)
+    # Lifecycle hook AFTER the txn commits, so observers never see partial state.
+    # Human input on a card is the one signal with no other delivery path: without
+    # this, a reply to a blocked question (kanban_block kind=needs_input) sits
+    # unread until some agent happens to re-read the card.
+    _fire_task_hook_by_id(
+        conn, "kanban_task_commented", task_id,
+        author=author.strip(), body=body.strip(), comment_id=comment_id,
+    )
+    return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
