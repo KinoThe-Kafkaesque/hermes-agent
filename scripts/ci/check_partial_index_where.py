@@ -22,12 +22,18 @@ always correct; ``PRAGMA integrity_check`` reads ``ok``; the composite
 ``hermes_cli/kanban_db_connect.py`` (the ``idx_runs_outcome_ended`` comment) and
 ``website/docs/user-guide/features/kanban.md``.
 
-What this check refuses is the SHAPE, not a measured instance: the live tree
-already carries six such sites (burn-down list below), so a shape-only refusal
-would be red on arrival. ``_BASELINE`` maps each pre-existing file to its hit
-count exactly like ``scripts/check_no_tmp_literals.py``; a file that GAINS a hit
-fails, and a stale/overstated entry is reported as an advisory so a parallel
-clean-up never turns CI red.
+What this check refuses is the SHAPE, not a measured instance. The live tree no
+longer carries any UNMARKED such site: each was either replaced with its composite
+form (``hermes_state_common.py``'s ``idx_messages_assistant_calls_by_session``,
+``cron/executions.py``'s ``idx_executions_occurrence``, and the
+``_heal_dangerous_partial_indexes`` migration that retires the old spelling on an
+already-open state.db) or, where the partial predicate is load-bearing for a
+production read AND the column is never bound with ``=``, kept partial with the
+sanctioned ``partial-index: ok`` marker (the display indexes and
+``idx_messages_session_uid`` — see the note in ``DEFERRED_INDEX_SQL``). ``_BASELINE``
+stays as the mechanism — ``scripts/check_no_tmp_literals.py``'s shape — so a future
+file that GAINS a hit fails, and a stale/overstated entry is reported as an advisory
+rather than turning CI red for a parallel clean-up.
 
 Measured detail that matters for the allow-list: the hazard is NOT restricted to
 the indexed column (``ON t(b) WHERE a='x'`` mis-serves), and the safe spellings
@@ -66,12 +72,11 @@ from pathlib import Path
 MARKER = "partial-index: ok"
 
 # Burn-down list: pre-existing dangerous-shaped sites, keyed by repo-relative
-# path -> hit count at the time this guard landed. Fix or mark the site and drop
-# the entry; a file that gains hits fails the check.
-_BASELINE: dict[str, int] = {
-    "cron/executions.py": 1,
-    "hermes_state_common.py": 8,
-}
+# path -> hit count at the time this guard landed. Now EMPTY — the six sites the
+# guard shipped with were retired by replacing each partial index with its
+# composite form (see the module docstring). The mechanism stays so a file that
+# GAINS a hit fails and a stale entry is an advisory.
+_BASELINE: dict[str, int] = {}
 
 # Directories whose ``CREATE INDEX`` statements are not production DDL: tests may
 # build hostile fixtures on purpose, docs quote the shape, evals are data.
@@ -172,6 +177,7 @@ def _tracked_python_files(root: Path) -> list[str]:
         ["git", "-C", str(root), "ls-files", "-z", "--", "*.py"],
         capture_output=True,
         timeout=300,
+        check=False,
     )
     if proc.returncode != 0:
         sys.stderr.write(

@@ -92,9 +92,31 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "delivery_outcome", "delivery_outcome TEXT")
     add_column_if_missing(conn, "executions", "scheduled_instant", "scheduled_instant TEXT")
     add_column_if_missing(conn, "executions", "progress_at", "progress_at TEXT")
+    # Replace the retired partial ``(job_id, scheduled_instant) WHERE status='completed'``
+    # on an already-created ledger. ``CREATE INDEX IF NOT EXISTS`` below is a no-op when the
+    # name exists, so a name-only create would leave every existing executions.db carrying
+    # the dangerous index. The stored DDL is TESTED for the dangerous shape rather than
+    # matched against a quoted copy of it, so this heals any equivalent spelling and cannot
+    # itself go stale.
+    from hermes_state_common import _partial_where_has_literal_equality
+    try:
+        stored = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='idx_executions_occurrence'"
+        ).fetchone()
+        if stored is not None and _partial_where_has_literal_equality(stored[0] or ""):
+            conn.execute("DROP INDEX IF EXISTS idx_executions_occurrence")
+    except sqlite3.OperationalError:
+        pass
+    # COMPOSITE, not the retired partial: a partial index whose WHERE equates a column to
+    # a scalar literal makes a REUSED parameterized statement return WRONG rows once the
+    # index appears under a live connection (measured; the vector is the cached statement
+    # — see scripts/ci/check_partial_index_where.py). ``status`` is a production bind
+    # parameter (the recovery UPDATEs, ``status IN (...)``), so the hazard is reachable
+    # here. The composite is exact and serves both consumers (``completed_occurrence``:
+    # job_id + scheduled_instant + status; and ``list_executions``: job_id).
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
-        "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+        "ON executions(job_id, scheduled_instant, status)"
     )
 
 
