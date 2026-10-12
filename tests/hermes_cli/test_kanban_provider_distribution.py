@@ -136,6 +136,90 @@ def test_completed_and_crashed_runs_also_record_their_provider(kanban_home):
         assert meta["model"] == SECONDARY[1]
 
 
+def _reap_this_processes_worker(pid: int, rc: int) -> None:
+    """Feed the reap registry the way ``os.waitpid`` does for a child of THIS process.
+
+    This is the gateway-embedded dispatcher: it reaps its own workers, so
+    ``_classify_worker_exit`` returns a real kind and (before the fix) the trailer
+    read was skipped entirely.
+    """
+    kbd._record_worker_exit(pid, (int(rc) & 0xFF) << 8)
+
+
+def test_a_locally_reaped_wall_still_names_the_route_that_served_it(kanban_home):
+    """The gateway-embedded dispatcher reaps its own children — and must still attribute.
+
+    This is the production path. The trailer read used to be gated behind
+    ``kind == "unknown"``, which is never true here, so every wall the gateway
+    booked recorded ``provider: null`` and the shared demotion tally saw nothing:
+    measured on the live board, 203 of 203 gateway-reaped ``rate_limited`` rows
+    were null. The trailer names the route even when the rc came from the reap
+    registry, so attribution must not depend on which process noticed the death.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        _dead_worker_with_log(conn, tid, 80011, kb.KANBAN_RATE_LIMIT_EXIT_CODE, *PRIMARY)
+
+        _reap_this_processes_worker(80011, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        kbd.detect_crashed_workers(conn)
+
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        meta = kb._json_dict(run["metadata"])
+        assert run["outcome"] == "rate_limited"
+        assert meta["provider"] == PRIMARY[0], "a locally reaped wall lost its route"
+        assert meta["model"] == PRIMARY[1]
+        assert meta["wall_count"] == 1
+
+
+def test_a_locally_reaped_wall_is_visible_to_the_shared_tally(kanban_home):
+    """The end-to-end property: a gateway-reaped wall DEMOTES the route.
+
+    Attribution is only worth anything if ``walled_routes()`` — the shared,
+    cross-process read — acts on it. Before the fix the row was written with a
+    null provider and ``_shared_wall_events`` skipped it, so the whole
+    cross-process failover feature was deployed and inert.
+    """
+    with kbc.connect() as conn:
+        for n, pid in enumerate((80021, 80022)):
+            tid = kb.create_task(conn, title=f"t{n}", assignee="a")
+            _dead_worker_with_log(conn, tid, pid, kb.KANBAN_RATE_LIMIT_EXIT_CODE, *PRIMARY)
+            _reap_this_processes_worker(pid, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+            kbd.detect_crashed_workers(conn)
+
+        assert kpd.walled_routes() == {PRIMARY}, "the shared tally never saw the walls"
+
+
+def test_a_stale_log_tail_from_a_later_run_is_not_charged_to_its_route(kanban_home):
+    """The log is append-mode: a tail trailer from a LATER run must be discarded whole.
+
+    Measured on the live board, 37 of 50 latest ``rate_limited`` runs (rc=75) tail
+    a trailer carrying a DIFFERENT rc — typically rc=0 from the run that later
+    succeeded, on the fallback provider. Trusting that trailer would stamp the
+    wrong rc on the wall and charge it to a route that never served it. The
+    observed rc is the discriminator, so the mismatched trailer is ignored — and
+    the wall stays unnamed (demoting nothing) rather than guessed.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="a")
+        # The log's last trailer is the LATER successful run on the fallback.
+        _dead_worker_with_log(conn, tid, 80031, 0, *SECONDARY)
+        # …but THIS run was reaped rate-limited on the primary.
+        _reap_this_processes_worker(80031, kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        kbd.detect_crashed_workers(conn)
+
+        run = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (tid,)
+        ).fetchone()
+        meta = kb._json_dict(run["metadata"])
+        assert run["outcome"] == "rate_limited"
+        assert meta["provider"] is None, "a later run's route was charged to this wall"
+        assert meta["model"] is None
+        assert "wall_count" not in meta
+        assert kpd.walled_routes() == set()
+
+
 def test_legacy_worker_without_provider_still_classifies(kanban_home):
     """An older binary that names no provider parses fine and demotes nothing.
 
@@ -429,7 +513,7 @@ def test_default_spawn_fails_open_when_route_resolution_breaks(kanban_home, monk
 # from the board DB. These tests drive that path end to end.
 
 
-def _persisted_wall(conn, tid: str, pid: int, provider: str, model: str,
+def _persisted_wall(conn, tid: str, pid: int, provider: str | None, model: str | None,
                     *, ended_at: float | None = None, outcome: str = "rate_limited",
                     pid_in_metadata: bool = True) -> None:
     """Write the run row a wall leaves behind — the SHARED tally's only input.
@@ -444,7 +528,7 @@ def _persisted_wall(conn, tid: str, pid: int, provider: str, model: str,
     conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
     run_id = kb.get_task(conn, tid).current_run_id
     conn.execute("UPDATE task_runs SET worker_pid=? WHERE id=?", (pid, run_id))
-    meta = {"provider": provider, "model": model}
+    meta: dict[str, object] = {"provider": provider, "model": model}
     if pid_in_metadata:
         meta["pid"] = pid
     conn.execute(
@@ -531,18 +615,28 @@ def test_persisted_wall_outside_the_window_does_not_demote(kanban_home):
 
 
 def test_unnamed_persisted_wall_demotes_nothing(kanban_home):
-    """A legacy row with no attributed route is not charged to any provider."""
+    """A legacy row with no attributed route is not charged to any provider.
+
+    The arm writes TWO unnamed rows, not one: ``demotion_threshold()`` is 2, so a
+    single unnamed row leaves ``walled_routes()`` empty whether or not the reader
+    skips it — the assertion would hold for a reader that CHARGED the wall to a
+    guessed route. Two rows make the property discriminating: a reader that
+    substituted a provider here would reach the threshold and return a non-empty
+    set, so this pin REDs under exactly that mutation (proven by
+    ``mut_dir1.sh``: mutating the reader's ``route is None`` skip into a guess
+    leaves the one-row form green and reds this two-row form).
+    """
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="t", assignee="a")
-        kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w70020")
-        run_id = kb.get_task(conn, tid).current_run_id
-        conn.execute(
-            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
-            "ended_at=?, metadata=? WHERE id=?",
-            (int(time.time()), kb._json_or_null({"exit_code": 75}), run_id),
-        )
-        conn.commit()
+        for n, pid in enumerate((70020, 70021)):
+            tid = kb.create_task(conn, title=f"legacy{n}", assignee="a")
+            # The canonical fixture helper with no route: metadata carries
+            # ``provider: null``, exactly the legacy row shape production wrote.
+            _persisted_wall(conn, tid, pid, None, None)
+        # Two unnamed walls, both inside the window: still no demotion, because
+        # neither row names a route. The count assertion is the discriminating
+        # half — the reader must not manufacture a route to reach the threshold.
         assert kpd.walled_routes() == set()
+        assert kpd._wall_counts() == {}
 
 
 def test_shared_tally_read_failure_is_fail_open(kanban_home, monkeypatch):

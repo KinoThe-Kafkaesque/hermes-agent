@@ -270,43 +270,20 @@ def _exit_code_kind(code: int) -> "tuple[str, int]":
     return ("nonzero_exit", code)
 
 
-_EXIT_TRAILER_RE = re.compile(
-    r"^" + re.escape(KANBAN_WORKER_EXIT_TRAILER) + r"(\d+)\s*$", re.MULTILINE,
+# The worker-log readers (exit trailer, last printed output) live in the topical
+# sibling ``kanban_db_workerlog``; re-exported here so existing ``kbd.<name>``
+# callers and tests keep working. Moved out to offset this file's FILE_LINES
+# growth when the provider-attribution fix landed (see ``scripts/check --only
+# health``: the file may only go down).
+from hermes_cli.kanban_db_workerlog import (  # noqa: E402
+    _EXIT_TRAILER_RE,
+    _exit_summary_marker,
+    _LOG_CHROME,
+    _log_noise_prefixes,
+    _worker_final_output,
+    _worker_log_exit_code,
+    _worker_log_exit_trailer,
 )
-
-
-def _worker_log_exit_trailer(task_id: str, board: Optional[str] = None):
-    """``(exit_code, provider, model)`` from the trailer the worker CLI wrote to its own log;
-    all None when absent.
-
-    The durable twin of ``_recent_worker_exits``: written by the worker itself
-    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs. The provider/model fields are
-    optional and absent from an older worker binary, which parses fine: the rc is
-    the load-bearing field and an unnamed route records as unknown rather than
-    failing the classification.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return None, None, None
-    trailer = parse_exit_trailer(raw)
-    if trailer is None:
-        return None, None, None
-    return trailer.exit_code, trailer.provider, trailer.model
-
-
-def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional[int]:
-    """Exit code from the trailer the worker CLI wrote to its own log; None when absent.
-
-    The durable twin of ``_recent_worker_exits``: written by the worker itself
-    (``hermes_cli.quiet_single_query.exit_single_query``), so it is there whether
-    or not the process running this sweep ever reaped the worker. Last trailer
-    wins — the log is append-mode across re-runs.
-    """
-    code, _provider, _model = _worker_log_exit_trailer(task_id, board=board)
-    return code
 
 
 def reap_worker_zombies() -> "list[int]":
@@ -1005,54 +982,6 @@ _PROTOCOL_VIOLATION_ERROR = (
 )
 
 
-# Rich panel/rule chrome around the rendered response, and the CLI's own preamble lines.
-_LOG_CHROME = re.compile(r"[─━═╭╮╰╯│┃┌┐└┘]+|☤\s*Hermes")
-
-
-def _exit_summary_marker() -> str:
-    """The CLI exit-summary header (``cli_session_mixin.show_exit_summary``), in the active language."""
-    from agent.i18n import t
-    return t("cli.session.exit_resume_hint")
-
-
-def _log_noise_prefixes() -> tuple[str, ...]:
-    from agent.i18n import t
-    return ("session_id:", "Query:", t("cli.chat.initializing_agent"))
-
-
-def _worker_final_output(task_id: str, board: Optional[str] = None) -> str:
-    """Best-effort read of a dead worker's last printed text, for the board diagnostic.
-
-    A ``chat -q`` worker's stdout/stderr are redirected to its per-task log
-    (``_default_spawn``), so when it exits without a terminal board call the
-    reason is usually sitting there: the model's own explanation of why it could
-    not comply (#88603), or the rendered provider error (#46593). The reap used to
-    discard it in favour of a canned message on every retry. Trims the CLI exit
-    summary, rule lines and the ``session_id:`` trailer; returns "" (never raises)
-    on a missing/empty log.
-
-    ``board`` must come from the dispatching tick: ambient current-board resolution
-    is wrong for every board but the one the dispatcher thread happens to call
-    "current", so the log would silently not be found.
-    """
-    try:
-        raw = _kb.read_worker_log(task_id, tail_bytes=4000, board=board)
-    except Exception:
-        return ""
-    if not raw:
-        return ""
-    raw = strip_exit_trailer(raw)
-    cut = raw.rfind(_exit_summary_marker())
-    if cut != -1:
-        raw = raw[:cut]
-    lines = []
-    for ln in raw.splitlines():
-        ln = _LOG_CHROME.sub("", ln).strip()
-        if ln and not ln.startswith(_log_noise_prefixes()):
-            lines.append(ln)
-    return " ".join(lines)[-400:]
-
-
 @dataclass
 class _DeadWorker:
     """How ``detect_crashed_workers`` should book one dead worker."""
@@ -1125,12 +1054,29 @@ def _classify_dead_worker_exit(
     gets the same booking (protocol violation / rate-limit requeue / crash) as
     under the gateway-embedded dispatcher. A worker that never reached its exit
     epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+
+    The trailer is read on EVERY dead-worker path, not only when the reap
+    registry is empty. It used to be gated behind ``kind == "unknown"``, which
+    meant the gateway-embedded dispatcher — the one that DOES reap its own
+    children, and the only dispatcher this fleet runs — classified from the wait
+    status and never looked at the trailer at all. The trailer is where the
+    worker names the route that served it (``provider=``/``model=``), so every
+    wall on that path recorded ``provider: null`` and the cross-process demotion
+    tally had nothing to read: measured on the live board, 203 of 203
+    gateway-reaped ``rate_limited`` rows carried a null provider. Reading it
+    unconditionally is what makes a wall attributable; the route is still only
+    recorded when the worker actually named one, so an unnamed wall keeps
+    demoting nothing.
     """
     kind, code = _classify_worker_exit(pid)
     trailer_provider = trailer_model = None
-    if kind == "unknown" and task_id:
-        logged, trailer_provider, trailer_model = _worker_log_exit_trailer(task_id, board=board)
-        if logged is not None:
+    if task_id:
+        # ``code`` is this run's rc when the registry reaped it, else None. The
+        # log tail may belong to a LATER run of the same task (append-mode log),
+        # so the trailer is only trusted when its rc matches what we observed.
+        logged, trailer_provider, trailer_model = _worker_log_exit_trailer(
+            task_id, board=board, observed_code=code)
+        if kind == "unknown" and logged is not None:
             kind, code = _exit_code_kind(logged)
     if kind == "clean_exit":
         # rc=0 while still ``running``: usually the work succeeded and only the
